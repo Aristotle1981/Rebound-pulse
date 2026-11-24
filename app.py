@@ -1,4 +1,5 @@
 import datetime
+from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -67,6 +68,7 @@ st.markdown(
         .small-muted {
             font-size: 0.78rem;
             color: #94a3b8;
+            line-height: 1.5;
         }
     </style>
     """,
@@ -75,8 +77,22 @@ st.markdown(
 
 
 # -----------------------------------------------------------------------------
-# DATA FETCHING & TECHNICAL CALCULATIONS
+# HELPERS & TECHNICAL CALCULATIONS
 # -----------------------------------------------------------------------------
+def clamp(val: float, lo: float, hi: float) -> float:
+    """Keep slider defaults safely within min/max bounds during extreme market moves."""
+    return max(lo, min(hi, float(val)))
+
+
+def get_sydney_time_str() -> str:
+    """Return current Sydney time with seconds so refreshes are visibly confirmed."""
+    try:
+        tz = ZoneInfo("Australia/Sydney")
+    except Exception:
+        tz = datetime.timezone(datetime.timedelta(hours=11), name="AEDT")
+    return datetime.datetime.now(tz).strftime("%d %b %Y, %I:%M:%S %p %Z")
+
+
 def compute_rsi(series: pd.Series, period: int = 14) -> float:
     """Wilder-style 14-day RSI."""
     clean = series.dropna()
@@ -128,11 +144,17 @@ def fetch_live_market_data() -> dict:
     dxy = extract_close_series(raw, "DX-Y.NYB")
     btc = extract_close_series(raw, "BTC-USD")
 
-    # 1. 10-Year Treasury Yield (%)
-    yield_10y = float(tnx.iloc[-1]) if len(tnx) else 4.50
-    if yield_10y > 20:  # Safety guard if feed quotes x10
-        yield_10y /= 10.0
-    yield_5d_chg = float(yield_10y - tnx.iloc[-6]) if len(tnx) >= 6 else 0.0
+    # Last Yahoo Finance equity candle date
+    yf_last_date = qqq.index[-1].strftime("%Y-%m-%d") if len(qqq) else "N/A"
+
+    # 1. 10-Year Treasury Yield (%) — normalize entire series before 5D delta
+    if len(tnx):
+        if float(tnx.iloc[-1]) > 20:
+            tnx = tnx / 10.0
+        yield_10y = float(tnx.iloc[-1])
+        yield_5d_chg = float(yield_10y - tnx.iloc[-6]) if len(tnx) >= 6 else 0.0
+    else:
+        yield_10y, yield_5d_chg = 4.50, 0.0
 
     # 2. VIX level & trajectory
     vix_val = float(vix.iloc[-1]) if len(vix) else 20.0
@@ -172,13 +194,17 @@ def fetch_live_market_data() -> dict:
     hy_spread = 3.50
     hy_5d_chg = 0.0
     fred_ok = False
+    fred_last_date = "N/A"
     try:
         fred_url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=BAMLH0A0HYM2"
         fred_df = pd.read_csv(fred_url)
-        hy_series = pd.to_numeric(fred_df.iloc[:, 1], errors="coerce").dropna()
-        if len(hy_series) >= 6:
-            hy_spread = float(hy_series.iloc[-1])
-            hy_5d_chg = float(hy_spread - hy_series.iloc[-6])
+        fred_df.columns = ["date", "val"]
+        fred_df["val"] = pd.to_numeric(fred_df["val"], errors="coerce")
+        fred_df = fred_df.dropna(subset=["val"])
+        if len(fred_df) >= 6:
+            hy_spread = float(fred_df["val"].iloc[-1])
+            hy_5d_chg = float(hy_spread - fred_df["val"].iloc[-6])
+            fred_last_date = str(fred_df["date"].iloc[-1])
             fred_ok = True
     except Exception:
         fred_ok = False
@@ -191,7 +217,9 @@ def fetch_live_market_data() -> dict:
         btc_dd_pct = 0.0
 
     return {
-        "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+        "timestamp": get_sydney_time_str(),
+        "yf_last_date": yf_last_date,
+        "fred_last_date": fred_last_date,
         "yield_10y": round(yield_10y, 2),
         "yield_5d_chg": round(yield_5d_chg, 2),
         "vix": round(vix_val, 2),
@@ -222,18 +250,12 @@ def evaluate_rebound(
     dxy: float,
     btc_dd_pct: float,
 ) -> dict:
-    """
-    Score each indicator on its contribution to a strong, sustainable rebound.
-    Returns overall score (0-100), short-term snapback score, long-term score,
-    and ranked bottleneck diagnostics.
-    """
     components = []
 
-    # 1. 10-Year Treasury Yield (Max 25 pts — biggest long-term driver)
+    # 1. 10-Year Treasury Yield (Max 25 pts)
     max_y = 25.0
     if yield_10y <= 4.00:
-        pts_y = 25.0
-        status_y = "GREEN LIGHT"
+        pts_y, status_y = 25.0, "GREEN LIGHT"
         msg_y = f"10Y Yield at {yield_10y:.2f}% is in the Goldilocks zone (3.5%–4.0%), supporting tech multiple expansion."
     elif yield_10y <= 4.50:
         pts_y = 18.0 + (4.50 - yield_10y) / 0.50 * 7.0
@@ -259,21 +281,19 @@ def evaluate_rebound(
         pts_v = 11.0 if vix >= 25 else 9.0
         status_v = "CAUTION"
         msg_v = f"VIX ({vix:.1f}) is stalling. Watch for a lower high to confirm fear has peaked."
-    else:  # Spiking
+    else:
         pts_v = 3.0 if vix >= 30 else 5.0
         status_v = "CRITICAL BLOCKER"
         msg_v = f"VIX ({vix:.1f}) is actively spiking — catching a falling knife until volatility stops making new highs."
     components.append(("VIX Fear Trajectory", pts_v, max_v, status_v, msg_v, "ST"))
 
-    # 3. Gold / Tech Correlation (Max 15 pts — "Correlations Going to 1" detector)
+    # 3. Gold / Tech Correlation (Max 15 pts)
     max_g = 15.0
     if gold_corr <= 0.15:
-        pts_g = 15.0
-        status_g = "GREEN LIGHT"
+        pts_g, status_g = 15.0, "GREEN LIGHT"
         msg_g = f"Gold/Tech correlation ({gold_corr:+.2f}) has decoupled — forced margin-call selling appears finished."
     elif gold_corr <= 0.45:
-        pts_g = 9.0
-        status_g = "CAUTION"
+        pts_g, status_g = 9.0, "CAUTION"
         msg_g = f"Gold/Tech correlation ({gold_corr:+.2f}) is moderately positive — lingering cross-asset deleveraging."
     else:
         pts_g = max(0.0, 4.0 - (gold_corr - 0.45) * 8.0)
@@ -284,12 +304,10 @@ def evaluate_rebound(
     # 4. High-Yield Credit Spreads (Max 15 pts)
     max_hy = 15.0
     if hy_spread <= 3.75:
-        pts_hy = 15.0
-        status_hy = "GREEN LIGHT"
+        pts_hy, status_hy = 15.0, "GREEN LIGHT"
         msg_hy = f"HY Credit Spreads ({hy_spread:.2f}%) remain calm — bond market is not pricing a systemic freeze."
     elif hy_spread <= 4.75:
-        pts_hy = 8.0
-        status_hy = "CAUTION"
+        pts_hy, status_hy = 8.0, "CAUTION"
         msg_hy = f"HY Credit Spreads ({hy_spread:.2f}%) are widening. Monitor for corporate stress."
     else:
         pts_hy = max(0.0, 4.0 - (hy_spread - 4.75) * 2.0)
@@ -300,58 +318,46 @@ def evaluate_rebound(
     # 5. Tech & Semis 14-Day RSI (Max 12 pts)
     max_r = 12.0
     if 28 <= tech_rsi <= 42:
-        pts_r = 12.0
-        status_r = "GREEN LIGHT"
+        pts_r, status_r = 12.0, "GREEN LIGHT"
         msg_r = f"Tech/Semi RSI ({tech_rsi:.1f}) is in the coiled oversold-to-rebound sweet spot."
     elif tech_rsi < 28:
-        pts_r = 9.0
-        status_r = "CAUTION"
+        pts_r, status_r = 9.0, "CAUTION"
         msg_r = f"Tech/Semi RSI ({tech_rsi:.1f}) is deeply oversold — primed for a sharp snapback, though still washed out."
     elif tech_rsi <= 55:
-        pts_r = 8.0
-        status_r = "GREEN LIGHT"
+        pts_r, status_r = 8.0, "GREEN LIGHT"
         msg_r = f"Tech/Semi RSI ({tech_rsi:.1f}) is neutral and stabilizing."
     else:
-        pts_r = 5.0
-        status_r = "CAUTION"
+        pts_r, status_r = 5.0, "CAUTION"
         msg_r = f"Tech/Semi RSI ({tech_rsi:.1f}) is not oversold — less pent-up short-covering fuel."
     components.append(("Tech & Semis RSI (QQQ/SMH)", pts_r, max_r, status_r, msg_r, "ST"))
 
     # 6. US Dollar Index — DXY (Max 8 pts)
     max_d = 8.0
     if dxy <= 101.5:
-        pts_d = 8.0
-        status_d = "GREEN LIGHT"
+        pts_d, status_d = 8.0, "GREEN LIGHT"
         msg_d = f"DXY ({dxy:.2f}) is relaxed — global dollar liquidity pressure is off."
     elif dxy <= 104.5:
-        pts_d = 4.5
-        status_d = "CAUTION"
+        pts_d, status_d = 4.5, "CAUTION"
         msg_d = f"DXY ({dxy:.2f}) is firm — mild 'dash for cash' headwind for risk assets & commodities."
     else:
-        pts_d = 1.0
-        status_d = "CRITICAL BLOCKER"
+        pts_d, status_d = 1.0, "CRITICAL BLOCKER"
         msg_d = f"DXY ({dxy:.2f}) is surging — strong dollar squeeze is crushing equities, gold, and crypto."
     components.append(("US Dollar Liquidity (DXY)", pts_d, max_d, status_d, msg_d, "LT"))
 
     # 7. Crypto Leverage Flush Proxy (Max 7 pts)
     max_c = 7.0
     if btc_dd_pct <= 4.0:
-        pts_c = 7.0
-        status_c = "GREEN LIGHT"
+        pts_c, status_c = 7.0, "GREEN LIGHT"
         msg_c = f"BTC 5D drawdown ({btc_dd_pct:.1f}%) is muted — forced crypto liquidations have cooled."
     elif btc_dd_pct <= 10.0:
-        pts_c = 4.0
-        status_c = "CAUTION"
+        pts_c, status_c = 4.0, "CAUTION"
         msg_c = f"BTC 5D drawdown ({btc_dd_pct:.1f}%) shows active deleveraging in high-beta risk."
     else:
-        pts_c = 1.0
-        status_c = "CRITICAL BLOCKER"
+        pts_c, status_c = 1.0, "CRITICAL BLOCKER"
         msg_c = f"BTC 5D drawdown ({btc_dd_pct:.1f}%) signals heavy forced liquidations still flushing out."
     components.append(("Crypto Leverage Flush", pts_c, max_c, status_c, msg_c, "ST"))
 
     total_score = round(sum(c[1] for c in components), 1)
-
-    # Short-term snapback vs Sustained recovery sub-scores (normalized 0-100)
     st_items = [c for c in components if c[5] in ("ST", "BOTH")]
     lt_items = [c for c in components if c[5] in ("LT", "BOTH")]
     st_score = round(sum(c[1] for c in st_items) / sum(c[2] for c in st_items) * 100, 1)
@@ -366,20 +372,17 @@ def evaluate_rebound(
     else:
         regime, color, bg = "HIGH-CONVICTION REBOUND", "#10b981", "rgba(16, 185, 129, 0.16)"
 
-    # Rank blockers by largest point drag (max_pts - earned_pts)
-    diagnostics = []
-    for name, earned, max_p, status, msg, horizon in components:
-        drag = round(max_p - earned, 1)
-        diagnostics.append(
-            {
-                "name": name,
-                "earned": round(earned, 1),
-                "max": max_p,
-                "drag": drag,
-                "status": status,
-                "msg": msg,
-            }
-        )
+    diagnostics = [
+        {
+            "name": name,
+            "earned": round(earned, 1),
+            "max": max_p,
+            "drag": round(max_p - earned, 1),
+            "status": status,
+            "msg": msg,
+        }
+        for name, earned, max_p, status, msg, _ in components
+    ]
     diagnostics.sort(key=lambda x: x["drag"], reverse=True)
 
     return {
@@ -394,7 +397,6 @@ def evaluate_rebound(
 
 
 def render_multimeter(score: float, color: str) -> go.Figure:
-    """Institutional 0-100 Rebound Multimeter Gauge."""
     fig = go.Figure(
         go.Indicator(
             mode="gauge+number",
@@ -435,12 +437,11 @@ def render_multimeter(score: float, color: str) -> go.Figure:
 
 
 # -----------------------------------------------------------------------------
-# MAIN UI (WITH ONE-CLICK RESET & LIVE REFRESH)
+# MAIN UI (LIVE REFRESH + TOAST + PRESETS)
 # -----------------------------------------------------------------------------
 st.markdown('<div class="pulse-header">REBOUND PULSE // LIVE MACRO TERMINAL</div>', unsafe_allow_html=True)
 st.markdown('<div class="pulse-title">Market Rebound Multimeter</div>', unsafe_allow_html=True)
 
-# Keys for simulator controls so we can reset them cleanly on click
 SIM_KEYS = [
     "sim_mode",
     "s_yield",
@@ -453,14 +454,53 @@ SIM_KEYS = [
     "s_btc_dd",
 ]
 
+PRESETS = {
+    "Goldilocks Bottom": {
+        "s_yield": 3.95,
+        "s_vix": 24.0,
+        "s_vix_state": "Rolling Over",
+        "s_rsi": 34.0,
+        "s_corr": -0.10,
+        "s_hy": 3.40,
+        "s_dxy": 100.5,
+        "s_btc_dd": 3.0,
+    },
+    "Dead-Cat Bounce": {
+        "s_yield": 4.90,
+        "s_vix": 28.5,
+        "s_vix_state": "Peaking / Stalling",
+        "s_rsi": 36.0,
+        "s_corr": 0.60,
+        "s_hy": 4.10,
+        "s_dxy": 104.25,
+        "s_btc_dd": 8.5,
+    },
+    "2020-Style Freeze": {
+        "s_yield": 5.20,
+        "s_vix": 48.0,
+        "s_vix_state": "Spiking",
+        "s_rsi": 22.0,
+        "s_corr": 0.85,
+        "s_hy": 6.50,
+        "s_dxy": 108.5,
+        "s_btc_dd": 22.0,
+    },
+}
+
 
 def reset_and_refresh_live():
-    """Clear cached feeds, exit What-If mode, and wipe slider overrides."""
     fetch_live_market_data.clear()
     for k in SIM_KEYS:
         if k in st.session_state:
             del st.session_state[k]
     st.session_state["sim_mode"] = False
+    st.session_state["just_refreshed"] = True
+
+
+def apply_preset(preset_name: str):
+    st.session_state["sim_mode"] = True
+    for k, v in PRESETS[preset_name].items():
+        st.session_state[k] = v
 
 
 top_c1, top_c2 = st.columns([1.8, 1.2])
@@ -476,14 +516,21 @@ with top_c2:
 with st.spinner("Pulling live macro feeds (Yahoo Finance + FRED)..."):
     live = fetch_live_market_data()
 
-# Choose live values or user-simulated overrides
+if st.session_state.pop("just_refreshed", False):
+    st.toast(f"Live feeds synced at {live['timestamp']}", icon="⚡")
+
 if sim_mode:
-    with st.expander("Adjust Indicators (Pre-filled with Live Data)", expanded=True):
+    with st.expander("Adjust Indicators & Scenario Presets", expanded=True):
+        p1, p2, p3 = st.columns(3)
+        p1.button("🟢 Goldilocks", on_click=apply_preset, args=("Goldilocks Bottom",), use_container_width=True)
+        p2.button("🟡 Dead-Cat", on_click=apply_preset, args=("Dead-Cat Bounce",), use_container_width=True)
+        p3.button("🔴 2020 Freeze", on_click=apply_preset, args=("2020-Style Freeze",), use_container_width=True)
+
         s_yield = st.slider(
-            "10-Year Treasury Yield (%)", 3.00, 5.75, float(live["yield_10y"]), 0.05, key="s_yield"
+            "10-Year Treasury Yield (%)", 2.50, 6.00, clamp(live["yield_10y"], 2.50, 6.00), 0.05, key="s_yield"
         )
         s_vix = st.slider(
-            "VIX Index", 12.0, 55.0, float(live["vix"]), 0.5, key="s_vix"
+            "VIX Index", 10.0, 65.0, clamp(live["vix"], 10.0, 65.0), 0.5, key="s_vix"
         )
         vix_opts = ["Spiking", "Peaking / Stalling", "Rolling Over"]
         s_vix_state = (
@@ -496,19 +543,19 @@ if sim_mode:
             or live["vix_state"]
         )
         s_rsi = st.slider(
-            "Tech & Semis 14D RSI (Avg QQQ/SMH)", 15.0, 75.0, float(live["tech_rsi"]), 0.5, key="s_rsi"
+            "Tech & Semis 14D RSI (Avg QQQ/SMH)", 10.0, 85.0, clamp(live["tech_rsi"], 10.0, 85.0), 0.5, key="s_rsi"
         )
         s_corr = st.slider(
-            "Gold / Tech 10D Correlation", -1.0, 1.0, float(live["gold_corr"]), 0.05, key="s_corr"
+            "Gold / Tech 10D Correlation", -1.0, 1.0, clamp(live["gold_corr"], -1.0, 1.0), 0.05, key="s_corr"
         )
         s_hy = st.slider(
-            "HY Credit Spreads — FRED OAS (%)", 2.50, 7.50, float(live["hy_spread"]), 0.05, key="s_hy"
+            "HY Credit Spreads — FRED OAS (%)", 2.00, 9.00, clamp(live["hy_spread"], 2.00, 9.00), 0.05, key="s_hy"
         )
         s_dxy = st.slider(
-            "US Dollar Index (DXY)", 95.0, 112.0, float(live["dxy"]), 0.25, key="s_dxy"
+            "US Dollar Index (DXY)", 90.0, 115.0, clamp(live["dxy"], 90.0, 115.0), 0.25, key="s_dxy"
         )
         s_btc_dd = st.slider(
-            "Crypto Flush Proxy (BTC 5D Drawdown %)", 0.0, 25.0, float(live["btc_dd_pct"]), 0.5, key="s_btc_dd"
+            "Crypto Flush Proxy (BTC 5D Drawdown %)", 0.0, 35.0, clamp(live["btc_dd_pct"], 0.0, 35.0), 0.5, key="s_btc_dd"
         )
 else:
     s_yield = live["yield_10y"]
@@ -583,8 +630,11 @@ m4.metric("Gold/Tech Corr", f"{s_corr:+.2f}", "Decoupled" if s_corr <= 0.15 else
 m5.metric("HY Spread (OAS)", f"{s_hy:.2f}%", f"{live['hy_5d_chg']:+.2f}% (5D)", delta_color="inverse")
 m6.metric("Dollar (DXY)", f"{s_dxy:.2f}", f"{live['dxy_5d_chg']:+.2f} (5D)", delta_color="inverse")
 
-fred_note = "FRED live" if live["fred_ok"] else "FRED fallback"
+fred_note = f"FRED ({live['fred_last_date']})" if live["fred_ok"] else "FRED fallback"
 st.markdown(
-    f'<div class="small-muted">Last sync: {live["timestamp"]} • Sources: Yahoo Finance & {fred_note} • Cached 5 min</div>',
+    f'<div class="small-muted">'
+    f'Last sync: <b>{live["timestamp"]}</b><br>'
+    f'Latest market candles: Yahoo Finance ({live["yf_last_date"]}) • {fred_note} • Auto-cache: 5 min'
+    f'</div>',
     unsafe_allow_html=True,
 )
