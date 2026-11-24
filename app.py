@@ -117,32 +117,53 @@ def get_sydney_time_str() -> str:
     return datetime.datetime.now(tz).strftime("%d %b %Y, %I:%M:%S %p %Z")
 
 
-def compute_rsi(series: pd.Series, period: int = 14) -> float:
+def extract_field_series(df: pd.DataFrame, field: str, ticker: str) -> pd.Series:
+    """Safely extract Close or Volume series across yfinance MultiIndex formats."""
+    if df.empty:
+        return pd.Series(dtype=float)
+    if isinstance(df.columns, pd.MultiIndex):
+        if field in df.columns.get_level_values(0) and ticker in df[field].columns:
+            return df[field][ticker].dropna()
+        if ticker in df.columns.get_level_values(0) and field in df[ticker].columns:
+            return df[ticker][field].dropna()
+    elif field in df.columns:
+        return df[field].dropna()
+    return pd.Series(dtype=float)
+
+
+def compute_rsi_metrics(series: pd.Series, period: int = 14) -> tuple[float, float]:
+    """Return (latest 14D RSI, 3-day RSI slope change)."""
     clean = series.dropna()
-    if len(clean) < period + 2:
-        return 50.0
+    if len(clean) < period + 5:
+        return 50.0, 0.0
     delta = clean.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
     avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
     avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
     rs = avg_gain / avg_loss.replace(0, np.nan)
-    rsi = 100 - (100 / (1 + rs))
-    val = rsi.iloc[-1]
-    return float(val) if pd.notna(val) else 50.0
+    rsi = (100 - (100 / (1 + rs))).dropna()
+    if len(rsi) < 4:
+        return 50.0, 0.0
+    latest = float(rsi.iloc[-1])
+    slope_3d = float(rsi.iloc[-1] - rsi.iloc[-4])
+    return latest, slope_3d
 
 
-def extract_close_series(df: pd.DataFrame, ticker: str) -> pd.Series:
-    if df.empty:
-        return pd.Series(dtype=float)
-    if isinstance(df.columns, pd.MultiIndex):
-        if "Close" in df.columns.get_level_values(0) and ticker in df["Close"].columns:
-            return df["Close"][ticker].dropna()
-        if ticker in df.columns.get_level_values(0) and "Close" in df[ticker].columns:
-            return df[ticker]["Close"].dropna()
-    elif "Close" in df.columns:
-        return df["Close"].dropna()
-    return pd.Series(dtype=float)
+def compute_red_vol_ratio(close_s: pd.Series, vol_s: pd.Series) -> float:
+    """Compare latest red-day volume (within last 5 sessions) to 20-day average volume."""
+    aligned = pd.concat([close_s.rename("c"), vol_s.rename("v")], axis=1).dropna()
+    if len(aligned) < 22:
+        return 1.0
+    avg_vol_20 = float(aligned["v"].rolling(20).mean().iloc[-1])
+    if avg_vol_20 <= 0:
+        return 1.0
+    recent = aligned.iloc[-5:].copy()
+    recent["chg"] = aligned["c"].diff().iloc[-5:]
+    red_days = recent[recent["chg"] < 0]
+    if red_days.empty:
+        return 0.75  # No recent red days -> selling pressure has dried up
+    return float(red_days["v"].iloc[-1] / avg_vol_20)
 
 
 def ma200_dist_and_dd(s: pd.Series):
@@ -172,14 +193,16 @@ def fetch_live_market_data() -> dict:
         threads=True,
     )
 
-    tnx = extract_close_series(raw, "^TNX")
-    vix = extract_close_series(raw, "^VIX")
-    qqq = extract_close_series(raw, "QQQ")
-    smh = extract_close_series(raw, "SMH")
-    rsp = extract_close_series(raw, "RSP")
-    gold = extract_close_series(raw, "GC=F")
-    dxy = extract_close_series(raw, "DX-Y.NYB")
-    btc = extract_close_series(raw, "BTC-USD")
+    tnx = extract_field_series(raw, "Close", "^TNX")
+    vix = extract_field_series(raw, "Close", "^VIX")
+    qqq = extract_field_series(raw, "Close", "QQQ")
+    smh = extract_field_series(raw, "Close", "SMH")
+    qqq_vol = extract_field_series(raw, "Volume", "QQQ")
+    smh_vol = extract_field_series(raw, "Volume", "SMH")
+    rsp = extract_field_series(raw, "Close", "RSP")
+    gold = extract_field_series(raw, "Close", "GC=F")
+    dxy = extract_field_series(raw, "Close", "DX-Y.NYB")
+    btc = extract_field_series(raw, "Close", "BTC-USD")
 
     yf_last_date = qqq.index[-1].strftime("%Y-%m-%d") if len(qqq) else "N/A"
 
@@ -206,10 +229,21 @@ def fetch_live_market_data() -> dict:
     else:
         vix_state = "Peaking / Stalling"
 
-    # 3. Tech & Semis 14D RSI
-    qqq_rsi = compute_rsi(qqq)
-    smh_rsi = compute_rsi(smh)
+    # 3. Tech & Semis 14D RSI + 3D Momentum Curl + Volume Exhaustion
+    qqq_rsi, qqq_rsi_3d = compute_rsi_metrics(qqq)
+    smh_rsi, smh_rsi_3d = compute_rsi_metrics(smh)
     tech_rsi = round((qqq_rsi + smh_rsi) / 2.0, 1)
+    rsi_3d_chg = round((qqq_rsi_3d + smh_rsi_3d) / 2.0, 1)
+
+    red_vol_ratio = round(
+        (compute_red_vol_ratio(qqq, qqq_vol) + compute_red_vol_ratio(smh, smh_vol)) / 2.0, 2
+    )
+    if rsi_3d_chg >= 1.5:
+        mom_state = "Curling Up"
+    elif rsi_3d_chg <= -2.0 and red_vol_ratio >= 1.10:
+        mom_state = "Diving (Heavy Vol)"
+    else:
+        mom_state = "Stalling / Drying Up"
 
     # 4. 200-Day MA Distance & 52W Drawdown
     qqq_ma200_dist, qqq_dd = ma200_dist_and_dd(qqq)
@@ -272,6 +306,9 @@ def fetch_live_market_data() -> dict:
         "qqq_rsi": round(qqq_rsi, 1),
         "smh_rsi": round(smh_rsi, 1),
         "tech_rsi": tech_rsi,
+        "rsi_3d_chg": rsi_3d_chg,
+        "red_vol_ratio": red_vol_ratio,
+        "mom_state": mom_state,
         "ma200_dist": avg_ma200_dist,
         "qqq_dd": round(qqq_dd, 1),
         "smh_dd": round(smh_dd, 1),
@@ -290,11 +327,10 @@ def fetch_live_market_data() -> dict:
 
 
 # -----------------------------------------------------------------------------
-# WATCHLIST SCANNER ENGINE
+# WATCHLIST SCANNER ENGINE (WITH MOMENTUM CURL)
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=300, show_spinner=False)
 def scan_watchlist(tickers_tuple: tuple, qqq_5d_return: float) -> pd.DataFrame:
-    """Fetch 1Y daily data for user watchlist and compute setup metrics."""
     tickers = list(tickers_tuple)
     if not tickers:
         return pd.DataFrame()
@@ -312,20 +348,26 @@ def scan_watchlist(tickers_tuple: tuple, qqq_5d_return: float) -> pd.DataFrame:
     index_etfs = {"QQQ", "SMH", "SPY", "VOO", "SOXX", "IVV", "RSP"}
 
     for t in tickers:
-        s = extract_close_series(raw, t)
+        s = extract_field_series(raw, "Close", t)
         if len(s) < 20:
             continue
 
         last_price = float(s.iloc[-1])
         ret_5d = (last_price / float(s.iloc[-6]) - 1.0) * 100.0 if len(s) >= 6 else 0.0
         rs_vs_qqq = ret_5d - qqq_5d_return
-        rsi = compute_rsi(s)
+        rsi, rsi_3d = compute_rsi_metrics(s)
         ma200_dist, dd_52w = ma200_dist_and_dd(s)
 
-        # Classify technical setup
+        if rsi_3d >= 1.5:
+            mom_tag = "↗ Curling"
+        elif rsi_3d <= -2.0:
+            mom_tag = "↘ Diving"
+        else:
+            mom_tag = "→ Flat"
+
         if rs_vs_qqq >= 1.5 and ma200_dist >= -2.0:
             setup = "RS Leader"
-        elif rsi <= 34.0 and ma200_dist >= -6.0:
+        elif rsi <= 36.0 and ma200_dist >= -6.0:
             setup = "Coiled Oversold"
         elif -3.5 <= ma200_dist <= 3.5:
             setup = "At 200D Support"
@@ -334,17 +376,23 @@ def scan_watchlist(tickers_tuple: tuple, qqq_5d_return: float) -> pd.DataFrame:
         else:
             setup = "Neutral"
 
-        # Composite Entry Quality Score (0-100) for ranking
         rank_score = 50.0
         rank_score += clamp(rs_vs_qqq * 3.0, -15.0, 20.0)
         if 28 <= rsi <= 42:
-            rank_score += 15.0
+            rank_score += 12.0
         elif rsi < 28:
-            rank_score += 8.0
+            rank_score += 6.0
         elif rsi > 65:
             rank_score -= 10.0
+
+        # Reward curling up from oversold; penalize still diving
+        if rsi <= 48 and rsi_3d >= 1.5:
+            rank_score += 10.0
+        elif rsi_3d <= -2.0:
+            rank_score -= 10.0
+
         if -3.0 <= ma200_dist <= 6.0:
-            rank_score += 15.0
+            rank_score += 12.0
         elif ma200_dist < -8.0:
             rank_score -= 15.0
 
@@ -355,6 +403,7 @@ def scan_watchlist(tickers_tuple: tuple, qqq_5d_return: float) -> pd.DataFrame:
                 "5D %": round(ret_5d, 1),
                 "RS vs QQQ": round(rs_vs_qqq, 1),
                 "RSI": round(rsi, 1),
+                "Momentum": mom_tag,
                 "vs 200D MA": round(ma200_dist, 1),
                 "52W DD": round(dd_52w, 1),
                 "Setup": setup,
@@ -369,21 +418,25 @@ def scan_watchlist(tickers_tuple: tuple, qqq_5d_return: float) -> pd.DataFrame:
 
 
 def assign_action_signal(row: pd.Series, macro_score: float) -> str:
-    """Tie each ticker's buy signal directly to the live Multimeter Score."""
     setup = row["Setup"]
     is_etf = row["IsETF"]
+    diving = row["Momentum"] == "↘ Diving"
 
     if macro_score < 35:
         return "🛑 Wait (Macro Red)"
     elif macro_score < 55:
-        if is_etf or setup == "RS Leader":
+        if (is_etf or setup == "RS Leader") and not diving:
             return "🟡 Scout Starter"
         return "⏳ Watch Only"
     elif macro_score < 75:
+        if diving:
+            return "⏳ Wait for Curl"
         if setup in ("RS Leader", "Coiled Oversold", "At 200D Support") or is_etf:
             return "🔵 Scale-In"
         return "⏳ Watch Only"
     else:
+        if diving:
+            return "🟡 Wait for Curl"
         if setup in ("RS Leader", "Coiled Oversold", "At 200D Support") or is_etf:
             return "🟢 Buy / Deploy"
         return "🔵 Accumulate"
@@ -401,6 +454,7 @@ def evaluate_rebound(
     ma200_dist: float,
     breadth_spread: float,
     tech_rsi: float,
+    mom_state: str,
     dxy: float,
     btc_dd_pct: float,
 ) -> dict:
@@ -498,21 +552,24 @@ def evaluate_rebound(
         msg_b = f"Breadth lagging ({breadth_spread:+.1f}%) — narrow mega-cap moves often signal a fragile bounce."
     components.append(("Market Breadth (RSP vs QQQ)", pts_b, max_b, status_b, msg_b, "BOTH"))
 
-    # 7. Tech & Semis 14-Day RSI (8 pts)
+    # 7. Tech & Semis RSI + Selling Exhaustion (8 pts)
     max_r = 8.0
-    if 28 <= tech_rsi <= 42:
+    if mom_state == "Diving (Heavy Vol)":
+        pts_r, status_r = 2.0, "CRITICAL BLOCKER"
+        msg_r = f"Tech/Semi RSI ({tech_rsi:.1f}) is still diving on heavy sell volume — no selling exhaustion yet."
+    elif tech_rsi <= 45 and mom_state == "Curling Up":
         pts_r, status_r = 8.0, "GREEN LIGHT"
-        msg_r = f"Tech/Semi RSI ({tech_rsi:.1f}) is in the coiled oversold-to-rebound sweet spot."
-    elif tech_rsi < 28:
-        pts_r, status_r = 6.0, "CAUTION"
-        msg_r = f"Tech/Semi RSI ({tech_rsi:.1f}) is deeply washed out — sharp snapback fuel, high volatility."
-    elif tech_rsi <= 55:
+        msg_r = f"Tech/Semi RSI ({tech_rsi:.1f}) is curling up from oversold levels — selling exhaustion confirmed."
+    elif tech_rsi <= 45 and mom_state == "Stalling / Drying Up":
+        pts_r, status_r = 6.0, "GREEN LIGHT"
+        msg_r = f"Tech/Semi RSI ({tech_rsi:.1f}) is stabilizing with fading red-day volume."
+    elif tech_rsi <= 58:
         pts_r, status_r = 5.5, "GREEN LIGHT"
-        msg_r = f"Tech/Semi RSI ({tech_rsi:.1f}) is neutral and stabilizing."
+        msg_r = f"Tech/Semi RSI ({tech_rsi:.1f}) is neutral ({mom_state})."
     else:
         pts_r, status_r = 3.5, "CAUTION"
-        msg_r = f"Tech/Semi RSI ({tech_rsi:.1f}) is not oversold — limited short-covering fuel."
-    components.append(("Tech & Semis RSI (QQQ/SMH)", pts_r, max_r, status_r, msg_r, "ST"))
+        msg_r = f"Tech/Semi RSI ({tech_rsi:.1f}) is elevated — limited oversold snapback fuel."
+    components.append(("RSI & Selling Exhaustion", pts_r, max_r, status_r, msg_r, "ST"))
 
     # 8. US Dollar Index — DXY (6 pts)
     max_d = 6.0
@@ -641,6 +698,7 @@ SIM_KEYS = [
     "s_vix",
     "s_vix_state",
     "s_rsi",
+    "s_mom_state",
     "s_ma200",
     "s_breadth",
     "s_corr",
@@ -655,6 +713,7 @@ PRESETS = {
         "s_vix": 24.0,
         "s_vix_state": "Rolling Over",
         "s_rsi": 34.0,
+        "s_mom_state": "Curling Up",
         "s_ma200": 0.5,
         "s_breadth": 1.2,
         "s_corr": -0.10,
@@ -667,6 +726,7 @@ PRESETS = {
         "s_vix": 28.5,
         "s_vix_state": "Peaking / Stalling",
         "s_rsi": 36.0,
+        "s_mom_state": "Stalling / Drying Up",
         "s_ma200": -4.5,
         "s_breadth": -1.5,
         "s_corr": 0.60,
@@ -679,6 +739,7 @@ PRESETS = {
         "s_vix": 48.0,
         "s_vix_state": "Spiking",
         "s_rsi": 22.0,
+        "s_mom_state": "Diving (Heavy Vol)",
         "s_ma200": -12.0,
         "s_breadth": -3.0,
         "s_corr": 0.85,
@@ -715,7 +776,7 @@ with top_c2:
         use_container_width=True,
     )
 
-with st.spinner("Pulling 1Y live macro & technical feeds (Yahoo Finance + FRED)..."):
+with st.spinner("Pulling 1Y live macro, volume & technical feeds (Yahoo Finance + FRED)..."):
     live = fetch_live_market_data()
 
 if st.session_state.pop("just_refreshed", False):
@@ -744,14 +805,24 @@ if sim_mode:
             )
             or live["vix_state"]
         )
+        s_rsi = st.slider(
+            "Tech & Semis 14D RSI (Avg QQQ/SMH)", 10.0, 85.0, clamp(live["tech_rsi"], 10.0, 85.0), 0.5, key="s_rsi"
+        )
+        mom_opts = ["Diving (Heavy Vol)", "Stalling / Drying Up", "Curling Up"]
+        s_mom_state = (
+            st.segmented_control(
+                "RSI Momentum & Volume Exhaustion",
+                options=mom_opts,
+                default=live["mom_state"],
+                key="s_mom_state",
+            )
+            or live["mom_state"]
+        )
         s_ma200 = st.slider(
             "QQQ/SMH Distance from 200-Day MA (%)", -20.0, 25.0, clamp(live["ma200_dist"], -20.0, 25.0), 0.5, key="s_ma200"
         )
         s_breadth = st.slider(
             "Market Breadth: RSP vs QQQ 5D Spread (%)", -6.0, 6.0, clamp(live["breadth_spread"], -6.0, 6.0), 0.2, key="s_breadth"
-        )
-        s_rsi = st.slider(
-            "Tech & Semis 14D RSI (Avg QQQ/SMH)", 10.0, 85.0, clamp(live["tech_rsi"], 10.0, 85.0), 0.5, key="s_rsi"
         )
         s_corr = st.slider(
             "Gold / Tech 10D Correlation", -1.0, 1.0, clamp(live["gold_corr"], -1.0, 1.0), 0.05, key="s_corr"
@@ -769,16 +840,17 @@ else:
     s_yield = live["yield_10y"]
     s_vix = live["vix"]
     s_vix_state = live["vix_state"]
+    s_rsi = live["tech_rsi"]
+    s_mom_state = live["mom_state"]
     s_ma200 = live["ma200_dist"]
     s_breadth = live["breadth_spread"]
-    s_rsi = live["tech_rsi"]
     s_corr = live["gold_corr"]
     s_hy = live["hy_spread"]
     s_dxy = live["dxy"]
     s_btc_dd = live["btc_dd_pct"]
 
 result = evaluate_rebound(
-    s_yield, s_vix, s_vix_state, s_corr, s_hy, s_ma200, s_breadth, s_rsi, s_dxy, s_btc_dd
+    s_yield, s_vix, s_vix_state, s_corr, s_hy, s_ma200, s_breadth, s_rsi, s_mom_state, s_dxy, s_btc_dd
 )
 
 # Regime Pill & Gauge
@@ -818,7 +890,7 @@ blockers = [d for d in result["diagnostics"] if d["status"] != "GREEN LIGHT"]
 greens = [d for d in result["diagnostics"] if d["status"] == "GREEN LIGHT"]
 
 if not blockers:
-    st.success("All 9 macro, breadth, and technical indicators are aligned for a sustained rebound.")
+    st.success("All 9 macro, breadth, and exhaustion indicators are aligned for a sustained rebound.")
 else:
     for b in blockers:
         border_col = "#ef4444" if b["status"] == "CRITICAL BLOCKER" else "#f59e0b"
@@ -843,10 +915,10 @@ if greens:
 st.divider()
 
 # -----------------------------------------------------------------------------
-# CURATED WATCHLIST SCANNER (TIED TO MULTIMETER SCORE)
+# CURATED WATCHLIST SCANNER (TIED TO MULTIMETER SCORE + MOMENTUM CURL)
 # -----------------------------------------------------------------------------
 st.subheader("🎯 Curated Watchlist Scanner")
-st.caption("Ranked by Relative Strength vs. QQQ, 14D RSI, and 200-Day MA support. Action signals adapt to the Multimeter Score.")
+st.caption("Ranked by Relative Strength vs. QQQ, RSI Curl, and 200D MA support. Action signals adapt to the Multimeter Score.")
 
 default_wl = "QQQ, SMH, NVDA, AMD, AVGO, MU, META, PLTR, ORCL, MRVL"
 wl_input = st.text_input("Watchlist Tickers (comma-separated)", value=default_wl)
@@ -859,7 +931,7 @@ if wl_df.empty:
     st.warning("No valid ticker data returned. Check your ticker symbols.")
 else:
     wl_df["Action"] = wl_df.apply(lambda r: assign_action_signal(r, result["score"]), axis=1)
-    display_cols = ["Ticker", "Price", "5D %", "RS vs QQQ", "RSI", "vs 200D MA", "52W DD", "Setup", "Action"]
+    display_cols = ["Ticker", "Price", "5D %", "RS vs QQQ", "RSI", "Momentum", "vs 200D MA", "Setup", "Action"]
     st.dataframe(
         wl_df[display_cols],
         use_container_width=True,
@@ -870,7 +942,6 @@ else:
             "RS vs QQQ": st.column_config.NumberColumn(format="%+.1f%%"),
             "RSI": st.column_config.NumberColumn(format="%.1f"),
             "vs 200D MA": st.column_config.NumberColumn(format="%+.1f%%"),
-            "52W DD": st.column_config.NumberColumn(format="%.1f%%"),
         },
     )
 
@@ -885,7 +956,7 @@ m3.metric("200D MA Dist", f"{s_ma200:+.1f}%", f"52W DD: {live['avg_dd_52w']:.1f}
 
 m4, m5, m6 = st.columns(3)
 m4.metric("Breadth (RSP-QQQ)", f"{s_breadth:+.1f}%", f"RSP 5D: {live['rsp_5d']:+.1f}%")
-m5.metric("Tech/Semi RSI", f"{s_rsi:.1f}", f"QQQ {live['qqq_rsi']} | SMH {live['smh_rsi']}")
+m5.metric("RSI & Exhaustion", f"{s_rsi:.1f}", f"{s_mom_state} ({live['rsi_3d_chg']:+.1f} 3D)")
 m6.metric("Gold/Tech Corr", f"{s_corr:+.2f}", "Decoupled" if s_corr <= 0.15 else "Correlated")
 
 m7, m8, m9 = st.columns(3)
@@ -896,7 +967,7 @@ m9.metric("BTC 5D Drawdown", f"-{s_btc_dd:.1f}%", "Cooled" if s_btc_dd <= 4.0 el
 fred_note = f"FRED ({live['fred_last_date']})" if live["fred_ok"] else "FRED fallback"
 st.markdown(
     f'<div class="small-muted">'
-    f'Last sync: <b>{live["timestamp"]}</b> • QQQ 52W DD: {live["qqq_dd"]:.1f}% | SMH 52W DD: {live["smh_dd"]:.1f}%<br>'
+    f'Last sync: <b>{live["timestamp"]}</b> • Red-day Vol vs 20D Avg: {live["red_vol_ratio"]:.2f}x<br>'
     f'Latest market candles: Yahoo Finance ({live["yf_last_date"]}) • {fred_note} • Auto-cache: 5 min'
     f'</div>',
     unsafe_allow_html=True,
