@@ -1,0 +1,40 @@
+name: Rebound Pulse Discord Alerts
+
+on:
+  schedule:
+    # 1. Daily Morning Brief: 8:15 AM AEDT (21:15 UTC Mon–Fri, right after US close)
+    - cron: "15 21 * * 1-5"
+    # 2. Intraday Trigger Checks: US Open (14:45 UTC) & Mid-Session (18:00 UTC) Mon–Fri
+    - cron: "45 14 * * 1-5"
+    - cron: "0 18 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Test mode (brief = always send, triggers = only if triggered)"
+        required: true
+        default: "brief"
+
+permissions:
+  contents: read
+
+jobs:
+  send-alert:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Install dependencies
+        run: pip install yfinance pandas numpy
+      - name: Run Rebound Pulse Alert Bot
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            python alert_bot.py --mode "${{ github.event.inputs.mode }}"
+          elif [ "${{ github.event.schedule }}" = "15 21 * * 1-5" ]; then
+            python alert_bot.py --mode brief
+          else
+            python alert_bot.py --mode triggers
+          fi
