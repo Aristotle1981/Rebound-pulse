@@ -1,3 +1,5 @@
+import urllib.parse
+import xml.etree.ElementTree as ET
 import argparse
 import datetime
 import json
@@ -200,6 +202,25 @@ def fetch_and_score() -> dict:
         "triggers": triggers,
     }
 
+def fetch_top_macro_headlines(limit: int = 3) -> str:
+    url = (
+        "https://news.google.com/rss/search?q="
+        + urllib.parse.quote("(Treasury yield OR Federal Reserve OR Nasdaq OR VIX) stock market when:1d")
+        + "&hl=en-US&gl=US&ceid=US:en"
+    )
+    lines = []
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            root = ET.fromstring(resp.read())
+        for item in root.findall(".//item")[:limit]:
+            title = (item.findtext("title") or "").strip()
+            link = (item.findtext("link") or "").strip()
+            if title:
+                lines.append(f"• [{title}]({link})" if link else f"• {title}")
+    except Exception:
+        pass
+    return "\n".join(lines) if lines else "• No major headlines fetched."
 
 def send_discord(webhook_url: str, data: dict, mode: str) -> None:
     title = (
@@ -221,6 +242,7 @@ def send_discord(webhook_url: str, data: dict, mode: str) -> None:
             {"name": "200D MA Dist", "value": f"{data['ma200']:+.1f}%", "inline": True},
             {"name": "Gold/Tech Corr", "value": f"{data['gold_corr']:+.2f}", "inline": True},
             {"name": "HY Spread / DXY", "value": f"{data['hy_spread']:.2f}% / {data['dxy']:.1f}", "inline": True},
+            {"name": "📰 Top Macro Catalysts", "value": fetch_top_macro_headlines(3), "inline": False},
         ],
         "footer": {"text": f"Rebound Pulse • {get_sydney_time_str()}"},
     }
