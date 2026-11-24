@@ -22,7 +22,7 @@ st.markdown(
         .block-container {
             padding-top: 1.2rem;
             padding-bottom: 2.5rem;
-            max-width: 760px;
+            max-width: 780px;
         }
         .pulse-header {
             font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
@@ -106,12 +106,10 @@ st.markdown(
 # HELPERS & TECHNICAL CALCULATIONS
 # -----------------------------------------------------------------------------
 def clamp(val: float, lo: float, hi: float) -> float:
-    """Keep slider defaults safely within min/max bounds during extreme moves."""
     return max(lo, min(hi, float(val)))
 
 
 def get_sydney_time_str() -> str:
-    """Return current Sydney time with seconds so refreshes are visibly confirmed."""
     try:
         tz = ZoneInfo("Australia/Sydney")
     except Exception:
@@ -120,7 +118,6 @@ def get_sydney_time_str() -> str:
 
 
 def compute_rsi(series: pd.Series, period: int = 14) -> float:
-    """Wilder-style 14-day RSI."""
     clean = series.dropna()
     if len(clean) < period + 2:
         return 50.0
@@ -136,7 +133,6 @@ def compute_rsi(series: pd.Series, period: int = 14) -> float:
 
 
 def extract_close_series(df: pd.DataFrame, ticker: str) -> pd.Series:
-    """Safely extract a single ticker's Close series across yfinance MultiIndex formats."""
     if df.empty:
         return pd.Series(dtype=float)
     if isinstance(df.columns, pd.MultiIndex):
@@ -149,9 +145,23 @@ def extract_close_series(df: pd.DataFrame, ticker: str) -> pd.Series:
     return pd.Series(dtype=float)
 
 
+def ma200_dist_and_dd(s: pd.Series):
+    if len(s) < 30:
+        return 0.0, 0.0
+    window = min(200, len(s))
+    ma200 = float(s.rolling(window).mean().iloc[-1])
+    last = float(s.iloc[-1])
+    high_52w = float(s.max())
+    dist_ma200 = (last - ma200) / ma200 * 100.0
+    dd_52w = (last - high_52w) / high_52w * 100.0
+    return dist_ma200, dd_52w
+
+
+# -----------------------------------------------------------------------------
+# LIVE MACRO DATA FETCH
+# -----------------------------------------------------------------------------
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_live_market_data() -> dict:
-    """Fetch 1 year of live macro & technical indicators from Yahoo Finance and FRED."""
     tickers = ["^TNX", "^VIX", "QQQ", "SMH", "RSP", "GC=F", "DX-Y.NYB", "BTC-USD"]
     raw = yf.download(
         tickers,
@@ -201,24 +211,13 @@ def fetch_live_market_data() -> dict:
     smh_rsi = compute_rsi(smh)
     tech_rsi = round((qqq_rsi + smh_rsi) / 2.0, 1)
 
-    # 4. Price Structure: Distance from 200-Day MA & Drawdown from 52W High
-    def ma200_dist_and_dd(s: pd.Series):
-        if len(s) < 50:
-            return 0.0, 0.0
-        window = min(200, len(s))
-        ma200 = float(s.rolling(window).mean().iloc[-1])
-        last = float(s.iloc[-1])
-        high_52w = float(s.max())
-        dist_ma200 = (last - ma200) / ma200 * 100.0
-        dd_52w = (last - high_52w) / high_52w * 100.0  # negative %
-        return dist_ma200, dd_52w
-
+    # 4. 200-Day MA Distance & 52W Drawdown
     qqq_ma200_dist, qqq_dd = ma200_dist_and_dd(qqq)
     smh_ma200_dist, smh_dd = ma200_dist_and_dd(smh)
     avg_ma200_dist = round((qqq_ma200_dist + smh_ma200_dist) / 2.0, 1)
     avg_dd_52w = round((qqq_dd + smh_dd) / 2.0, 1)
 
-    # 5. Market Breadth: RSP (Equal-Weight S&P 500) 5D return minus QQQ 5D return (%)
+    # 5. Market Breadth: RSP vs QQQ 5D Spread
     if len(rsp) >= 6 and len(qqq) >= 6:
         rsp_5d = (float(rsp.iloc[-1]) / float(rsp.iloc[-6]) - 1.0) * 100.0
         qqq_5d = (float(qqq.iloc[-1]) / float(qqq.iloc[-6]) - 1.0) * 100.0
@@ -226,7 +225,7 @@ def fetch_live_market_data() -> dict:
     else:
         rsp_5d, qqq_5d, breadth_spread = 0.0, 0.0, 0.0
 
-    # 6. Gold vs. Tech 10-day rolling return correlation
+    # 6. Gold vs. Tech 10-day rolling correlation
     aligned = pd.concat([gold.pct_change(), qqq.pct_change()], axis=1).dropna()
     if len(aligned) >= 10:
         gold_corr = float(aligned.iloc[-10:, 0].corr(aligned.iloc[-10:, 1]))
@@ -239,7 +238,7 @@ def fetch_live_market_data() -> dict:
     dxy_val = float(dxy.iloc[-1]) if len(dxy) else 103.0
     dxy_5d_chg = float(dxy_val - dxy.iloc[-6]) if len(dxy) >= 6 else 0.0
 
-    # 8. High-Yield Credit Spread (FRED: BAMLH0A0HYM2, in %)
+    # 8. High-Yield Credit Spread (FRED: BAMLH0A0HYM2)
     hy_spread, hy_5d_chg, fred_ok, fred_last_date = 3.50, 0.0, False, "N/A"
     try:
         fred_url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=BAMLH0A0HYM2"
@@ -255,7 +254,7 @@ def fetch_live_market_data() -> dict:
     except Exception:
         fred_ok = False
 
-    # 9. Crypto Deleveraging Stress Proxy (BTC 5-day drawdown %)
+    # 9. Crypto Leverage Flush Proxy
     if len(btc) >= 6:
         btc_5d_high = float(btc.iloc[-6:].max())
         btc_dd_pct = max(0.0, (btc_5d_high - float(btc.iloc[-1])) / btc_5d_high * 100.0)
@@ -277,6 +276,7 @@ def fetch_live_market_data() -> dict:
         "qqq_dd": round(qqq_dd, 1),
         "smh_dd": round(smh_dd, 1),
         "avg_dd_52w": avg_dd_52w,
+        "qqq_5d": round(qqq_5d, 2),
         "breadth_spread": breadth_spread,
         "rsp_5d": round(rsp_5d, 1),
         "gold_corr": round(gold_corr, 2),
@@ -287,6 +287,106 @@ def fetch_live_market_data() -> dict:
         "fred_ok": fred_ok,
         "btc_dd_pct": round(btc_dd_pct, 1),
     }
+
+
+# -----------------------------------------------------------------------------
+# WATCHLIST SCANNER ENGINE
+# -----------------------------------------------------------------------------
+@st.cache_data(ttl=300, show_spinner=False)
+def scan_watchlist(tickers_tuple: tuple, qqq_5d_return: float) -> pd.DataFrame:
+    """Fetch 1Y daily data for user watchlist and compute setup metrics."""
+    tickers = list(tickers_tuple)
+    if not tickers:
+        return pd.DataFrame()
+
+    raw = yf.download(
+        tickers,
+        period="1y",
+        interval="1d",
+        auto_adjust=True,
+        progress=False,
+        threads=True,
+    )
+
+    rows = []
+    index_etfs = {"QQQ", "SMH", "SPY", "VOO", "SOXX", "IVV", "RSP"}
+
+    for t in tickers:
+        s = extract_close_series(raw, t)
+        if len(s) < 20:
+            continue
+
+        last_price = float(s.iloc[-1])
+        ret_5d = (last_price / float(s.iloc[-6]) - 1.0) * 100.0 if len(s) >= 6 else 0.0
+        rs_vs_qqq = ret_5d - qqq_5d_return
+        rsi = compute_rsi(s)
+        ma200_dist, dd_52w = ma200_dist_and_dd(s)
+
+        # Classify technical setup
+        if rs_vs_qqq >= 1.5 and ma200_dist >= -2.0:
+            setup = "RS Leader"
+        elif rsi <= 34.0 and ma200_dist >= -6.0:
+            setup = "Coiled Oversold"
+        elif -3.5 <= ma200_dist <= 3.5:
+            setup = "At 200D Support"
+        elif ma200_dist < -8.0:
+            setup = "Below 200D (Weak)"
+        else:
+            setup = "Neutral"
+
+        # Composite Entry Quality Score (0-100) for ranking
+        rank_score = 50.0
+        rank_score += clamp(rs_vs_qqq * 3.0, -15.0, 20.0)
+        if 28 <= rsi <= 42:
+            rank_score += 15.0
+        elif rsi < 28:
+            rank_score += 8.0
+        elif rsi > 65:
+            rank_score -= 10.0
+        if -3.0 <= ma200_dist <= 6.0:
+            rank_score += 15.0
+        elif ma200_dist < -8.0:
+            rank_score -= 15.0
+
+        rows.append(
+            {
+                "Ticker": t,
+                "Price": round(last_price, 2),
+                "5D %": round(ret_5d, 1),
+                "RS vs QQQ": round(rs_vs_qqq, 1),
+                "RSI": round(rsi, 1),
+                "vs 200D MA": round(ma200_dist, 1),
+                "52W DD": round(dd_52w, 1),
+                "Setup": setup,
+                "IsETF": t in index_etfs,
+                "RankScore": round(clamp(rank_score, 0, 100), 1),
+            }
+        )
+
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).sort_values("RankScore", ascending=False).reset_index(drop=True)
+
+
+def assign_action_signal(row: pd.Series, macro_score: float) -> str:
+    """Tie each ticker's buy signal directly to the live Multimeter Score."""
+    setup = row["Setup"]
+    is_etf = row["IsETF"]
+
+    if macro_score < 35:
+        return "🛑 Wait (Macro Red)"
+    elif macro_score < 55:
+        if is_etf or setup == "RS Leader":
+            return "🟡 Scout Starter"
+        return "⏳ Watch Only"
+    elif macro_score < 75:
+        if setup in ("RS Leader", "Coiled Oversold", "At 200D Support") or is_etf:
+            return "🔵 Scale-In"
+        return "⏳ Watch Only"
+    else:
+        if setup in ("RS Leader", "Coiled Oversold", "At 200D Support") or is_etf:
+            return "🟢 Buy / Deploy"
+        return "🔵 Accumulate"
 
 
 # -----------------------------------------------------------------------------
@@ -373,13 +473,13 @@ def evaluate_rebound(
     max_m = 12.0
     if -3.0 <= ma200_dist <= 5.0:
         pts_m, status_m = 12.0, "GREEN LIGHT"
-        msg_m = f"QQQ/SMH ({ma200_dist:+.1f}% vs 200D MA) is sitting right at major institutional support — prime risk/reward."
+        msg_m = f"QQQ/SMH ({ma200_dist:+.1f}% vs 200D MA) is sitting right at major institutional support."
     elif ma200_dist > 5.0:
         pts_m, status_m = 8.5, "GREEN LIGHT"
         msg_m = f"QQQ/SMH ({ma200_dist:+.1f}% above 200D MA) remains in a healthy primary uptrend."
     elif ma200_dist >= -8.0:
         pts_m, status_m = 5.5, "CAUTION"
-        msg_m = f"QQQ/SMH ({ma200_dist:+.1f}% below 200D MA) has broken trend support — scale in slowly until reclaimed."
+        msg_m = f"QQQ/SMH ({ma200_dist:+.1f}% below 200D MA) broke trend support — scale in slowly until reclaimed."
     else:
         pts_m, status_m = 2.0, "CRITICAL BLOCKER"
         msg_m = f"QQQ/SMH ({ma200_dist:+.1f}% below 200D MA) is in deep bear-market territory — wait for base building."
@@ -389,7 +489,7 @@ def evaluate_rebound(
     max_b = 8.0
     if breadth_spread >= 0.5:
         pts_b, status_b = 8.0, "GREEN LIGHT"
-        msg_b = f"Equal-Weight S&P (RSP) is beating QQQ by {breadth_spread:+.1f}% (5D) — healthy, broad participation."
+        msg_b = f"Equal-Weight S&P (RSP) is beating QQQ by {breadth_spread:+.1f}% (5D) — broad participation."
     elif breadth_spread >= -1.0:
         pts_b, status_b = 5.5, "GREEN LIGHT"
         msg_b = f"Breadth spread ({breadth_spread:+.1f}%) is balanced — no severe narrow-leadership divergence."
@@ -591,6 +691,7 @@ PRESETS = {
 
 def reset_and_refresh_live():
     fetch_live_market_data.clear()
+    scan_watchlist.clear()
     for k in SIM_KEYS:
         if k in st.session_state:
             del st.session_state[k]
@@ -618,7 +719,7 @@ with st.spinner("Pulling 1Y live macro & technical feeds (Yahoo Finance + FRED).
     live = fetch_live_market_data()
 
 if st.session_state.pop("just_refreshed", False):
-    st.toast(f"Live feeds synced at {live['timestamp']}", icon="⚡")
+    st.toast(f"Live feeds & watchlist synced at {live['timestamp']}", icon="⚡")
 
 if sim_mode:
     with st.expander("Adjust Indicators & Scenario Presets", expanded=True):
@@ -738,6 +839,40 @@ if greens:
     with st.expander(f"✅ Supporting Indicators ({len(greens)} Green Lights)", expanded=False):
         for g in greens:
             st.markdown(f"**{g['name']}** ({g['earned']}/{g['max']} pts) — {g['msg']}")
+
+st.divider()
+
+# -----------------------------------------------------------------------------
+# CURATED WATCHLIST SCANNER (TIED TO MULTIMETER SCORE)
+# -----------------------------------------------------------------------------
+st.subheader("🎯 Curated Watchlist Scanner")
+st.caption("Ranked by Relative Strength vs. QQQ, 14D RSI, and 200-Day MA support. Action signals adapt to the Multimeter Score.")
+
+default_wl = "QQQ, SMH, NVDA, AMD, AVGO, MU, META, PLTR, ORCL, MRVL"
+wl_input = st.text_input("Watchlist Tickers (comma-separated)", value=default_wl)
+tickers_list = tuple(dict.fromkeys([t.strip().upper() for t in wl_input.split(",") if t.strip()]))
+
+with st.spinner("Scanning watchlist setups..."):
+    wl_df = scan_watchlist(tickers_list, live["qqq_5d"])
+
+if wl_df.empty:
+    st.warning("No valid ticker data returned. Check your ticker symbols.")
+else:
+    wl_df["Action"] = wl_df.apply(lambda r: assign_action_signal(r, result["score"]), axis=1)
+    display_cols = ["Ticker", "Price", "5D %", "RS vs QQQ", "RSI", "vs 200D MA", "52W DD", "Setup", "Action"]
+    st.dataframe(
+        wl_df[display_cols],
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Price": st.column_config.NumberColumn(format="$%.2f"),
+            "5D %": st.column_config.NumberColumn(format="%+.1f%%"),
+            "RS vs QQQ": st.column_config.NumberColumn(format="%+.1f%%"),
+            "RSI": st.column_config.NumberColumn(format="%.1f"),
+            "vs 200D MA": st.column_config.NumberColumn(format="%+.1f%%"),
+            "52W DD": st.column_config.NumberColumn(format="%.1f%%"),
+        },
+    )
 
 st.divider()
 
