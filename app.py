@@ -1,3 +1,6 @@
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
 import datetime
 from zoneinfo import ZoneInfo
 import numpy as np
@@ -933,6 +936,8 @@ def reset_and_refresh_live():
     fetch_live_intraday_tape.clear()
     fetch_live_market_data.clear()
     scan_watchlist.clear()
+    fetch_google_rss.clear()
+    fetch_ticker_news.clear()
     for k in SIM_KEYS:
         if k in st.session_state:
             del st.session_state[k]
@@ -1140,6 +1145,123 @@ else:
             "vs 200D MA": st.column_config.NumberColumn(format="%+.1f%%"),
         },
     )
+
+st.divider()
+
+# -----------------------------------------------------------------------------
+# LIVE CATALYST & NEWS WIRE (MACRO + UNUSUAL MOVERS + TICKER/SECTOR)
+# -----------------------------------------------------------------------------
+def tag_headline(title: str) -> str:
+    """Auto-tag headlines so catalysts are easy to scan on mobile."""
+    t = title.lower()
+    if any(k in t for k in ("earnings", "revenue", "eps", "guidance", "quarter", "q1", "q2", "q3", "q4", "beats", "misses")):
+        return "📊 Earnings"
+    if any(k in t for k in ("fed", "powell", "cpi", "ppi", "inflation", "yield", "treasury", "rate cut", "rate hike", "fomc", "jobs", "payroll")):
+        return "🏛️ Fed/Rates"
+    if any(k in t for k in ("tariff", "china", "war", "oil", "geopolitic", "sanction", "export")):
+        return "🌍 Geopolitics"
+    if any(k in t for k in ("upgrade", "downgrade", "price target", "analyst", "rating", "buy rating")):
+        return "📈 Analyst"
+    if any(k in t for k in ("ai", "chip", "semiconductor", "gpu", "data center", "blackwell", "hbm", "foundry")):
+        return "🤖 AI/Semis"
+    return "📰 Market"
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_google_rss(query: str, max_items: int = 6) -> list[dict]:
+    """Fetch recent headlines from Google News RSS (free, no API key)."""
+    url = f"https://news.google.com/rss/search?q={urllib.parse.quote(query)}&hl=en-US&gl=US&ceid=US:en"
+    items = []
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            root = ET.fromstring(resp.read())
+        for item in root.findall(".//item")[:max_items]:
+            title = (item.findtext("title") or "").strip()
+            link = (item.findtext("link") or "").strip()
+            pub = (item.findtext("pubDate") or "")[:22]
+            source = (item.findtext("source") or "News").strip()
+            if title:
+                items.append({
+                    "tag": tag_headline(title),
+                    "title": title,
+                    "source": source,
+                    "time": pub,
+                    "url": link,
+                })
+    except Exception:
+        pass
+    return items
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_ticker_news(ticker: str, max_items: int = 6) -> list[dict]:
+    """Fetch company/ETF headlines via yfinance (supports nested 'content' format)."""
+    items = []
+    try:
+        raw_news = yf.Ticker(ticker).news or []
+        for n in raw_news[:max_items]:
+            c = n.get("content", n) if isinstance(n, dict) else {}
+            title = (c.get("title") or "").strip()
+            url = (
+                (c.get("canonicalUrl") or {}).get("url")
+                or (c.get("clickThroughUrl") or {}).get("url")
+                or c.get("link")
+                or ""
+            )
+            source = (c.get("provider") or {}).get("displayName") or c.get("publisher") or "Yahoo Finance"
+            pub = str(c.get("pubDate") or "")[:16].replace("T", " ")
+            if title:
+                items.append({
+                    "tag": tag_headline(title),
+                    "title": title,
+                    "source": source,
+                    "time": pub,
+                    "url": url,
+                })
+    except Exception:
+        pass
+    return items
+
+
+def render_news_list(items: list[dict], empty_msg: str = "No recent headlines found."):
+    if not items:
+        st.caption(empty_msg)
+        return
+    for it in items:
+        link_md = f"[{it['title']}]({it['url']})" if it["url"] else it["title"]
+        st.markdown(
+            f"**{it['tag']}** — {link_md}  \n"
+            f"<span class='small-muted'>{it['source']} • {it['time']}</span>",
+            unsafe_allow_html=True,
+        )
+
+
+st.subheader("📰 Live Catalyst & News Wire")
+st.caption("Tracks macro drivers behind telemetry shifts and flags headlines for unusual after-hours movers.")
+
+tab_macro, tab_movers, tab_ticker = st.tabs(["🏛️ Macro & Rates", "⚡ Unusual Movers", "🎯 Ticker & Sector"])
+
+with tab_macro:
+    macro_news = fetch_google_rss("(Treasury yield OR Federal Reserve OR VIX OR Nasdaq OR S&P 500) stock market when:2d", max_items=6)
+    render_news_list(macro_news, "Could not load macro headlines right now.")
+
+with tab_movers:
+    if not wl_df.empty and "Ext. Reading" in wl_df.columns:
+        unusual = wl_df[wl_df["Ext. Reading"].str.contains("Unusual|Flush|Chase", na=False)]
+        if unusual.empty:
+            st.info("No unusual extended-hours movers detected in your watchlist right now.")
+        else:
+            for _, row in unusual.head(3).iterrows():
+                st.markdown(f"#### {row['Ticker']} ({row['Ext. Gap']:+.2f}% Ext.) — {row['Ext. Reading']}")
+                render_news_list(fetch_ticker_news(row["Ticker"], max_items=3))
+    else:
+        st.caption("Scan your watchlist above to detect unusual movers.")
+
+with tab_ticker:
+    lookup_options = list(tickers_list) if tickers_list else ["QQQ", "SMH", "NVDA"]
+    sel_ticker = st.selectbox("Select Ticker or Sector ETF", lookup_options, label_visibility="collapsed")
+    render_news_list(fetch_ticker_news(sel_ticker, max_items=6), f"No recent Yahoo Finance headlines for {sel_ticker}.")
 
 st.divider()
 
