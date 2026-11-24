@@ -22,7 +22,7 @@ st.markdown(
         .block-container {
             padding-top: 1.1rem;
             padding-bottom: 2.5rem;
-            max-width: 780px;
+            max-width: 820px;
         }
         .pulse-header {
             font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
@@ -179,7 +179,6 @@ def ma200_dist_and_dd(s: pd.Series):
 
 
 def compute_session_vwap_and_wick(df_15m: pd.DataFrame, ticker: str) -> tuple[float, float, float]:
-    """Return (last_price, % distance from latest session VWAP, % position in session High-Low range)."""
     c = extract_field_series(df_15m, "Close", ticker)
     h = extract_field_series(df_15m, "High", ticker)
     l = extract_field_series(df_15m, "Low", ticker)
@@ -188,7 +187,6 @@ def compute_session_vwap_and_wick(df_15m: pd.DataFrame, ticker: str) -> tuple[fl
     if aligned.empty:
         return 0.0, 0.0, 50.0
 
-    # Filter to the most recent trading date in the 15m feed
     last_date = aligned.index[-1].date()
     sess = aligned[aligned.index.date == last_date]
     if sess.empty:
@@ -215,7 +213,6 @@ def compute_session_vwap_and_wick(df_15m: pd.DataFrame, ticker: str) -> tuple[fl
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=55, show_spinner=False)
 def fetch_live_intraday_tape() -> dict:
-    """Fetch near-24/5 futures, 24/7 BTC, and 15m intraday QQQ/SMH/HYG/IEF."""
     tape_tickers = ["NQ=F", "ES=F", "GC=F", "BTC-USD", "QQQ", "SMH", "HYG", "IEF"]
     raw_15m = yf.download(
         tape_tickers,
@@ -232,7 +229,6 @@ def fetch_live_intraday_tape() -> dict:
         if len(s) < 2:
             return 0.0, 0.0
         last = float(s.iloc[-1])
-        # Compare against 24 hours (~96 15m bars) or earliest available
         prev_idx = max(0, len(s) - 96)
         prev = float(s.iloc[prev_idx])
         chg_pct = (last / prev - 1.0) * 100.0 if prev > 0 else 0.0
@@ -246,7 +242,6 @@ def fetch_live_intraday_tape() -> dict:
     qqq_p, qqq_vwap_dist, qqq_wick = compute_session_vwap_and_wick(raw_15m, "QQQ")
     smh_p, smh_vwap_dist, smh_wick = compute_session_vwap_and_wick(raw_15m, "SMH")
 
-    # Live intraday HYG / IEF credit stress proxy (1-day change in ratio)
     hyg = extract_field_series(raw_15m, "Close", "HYG")
     ief = extract_field_series(raw_15m, "Close", "IEF")
     cred_df = pd.concat([hyg.rename("hyg"), ief.rename("ief")], axis=1).dropna()
@@ -451,18 +446,30 @@ def fetch_live_market_data() -> dict:
 
 
 # -----------------------------------------------------------------------------
-# WATCHLIST SCANNER ENGINE (WITH MOMENTUM CURL + INTRADAY WICK REVERSAL)
+# WATCHLIST SCANNER ENGINE (WITH EXTENDED HOURS & ANOMALY READING)
 # -----------------------------------------------------------------------------
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=120, show_spinner=False)
 def scan_watchlist(tickers_tuple: tuple, qqq_5d_return: float) -> pd.DataFrame:
     tickers = list(tickers_tuple)
     if not tickers:
         return pd.DataFrame()
 
-    raw = yf.download(
+    # 1Y daily for clean RSI, 200D MA, and Regular Close
+    raw_daily = yf.download(
         tickers,
         period="1y",
         interval="1d",
+        auto_adjust=True,
+        progress=False,
+        threads=True,
+    )
+
+    # 2D 15m with prepost=True for live Extended-Hours (Pre-Market / After-Hours) price
+    raw_ext = yf.download(
+        tickers,
+        period="2d",
+        interval="15m",
+        prepost=True,
         auto_adjust=True,
         progress=False,
         threads=True,
@@ -472,22 +479,26 @@ def scan_watchlist(tickers_tuple: tuple, qqq_5d_return: float) -> pd.DataFrame:
     index_etfs = {"QQQ", "SMH", "SPY", "VOO", "SOXX", "IVV", "RSP"}
 
     for t in tickers:
-        c = extract_field_series(raw, "Close", t)
-        h = extract_field_series(raw, "High", t)
-        l = extract_field_series(raw, "Low", t)
+        c = extract_field_series(raw_daily, "Close", t)
+        h = extract_field_series(raw_daily, "High", t)
+        l = extract_field_series(raw_daily, "Low", t)
         if len(c) < 20:
             continue
 
-        last_price = float(c.iloc[-1])
-        day_h = float(h.iloc[-1]) if len(h) else last_price
-        day_l = float(l.iloc[-1]) if len(l) else last_price
+        reg_close = float(c.iloc[-1])
+        ext_series = extract_field_series(raw_ext, "Close", t)
+        ext_price = float(ext_series.iloc[-1]) if len(ext_series) else reg_close
+        ext_gap_pct = (ext_price / reg_close - 1.0) * 100.0 if reg_close > 0 else 0.0
+
+        day_h = float(h.iloc[-1]) if len(h) else reg_close
+        day_l = float(l.iloc[-1]) if len(l) else reg_close
         wick_pct = (
-            (last_price - day_l) / (day_h - day_l) * 100.0
+            (reg_close - day_l) / (day_h - day_l) * 100.0
             if day_h > day_l
             else 50.0
         )
 
-        ret_5d = (last_price / float(c.iloc[-6]) - 1.0) * 100.0 if len(c) >= 6 else 0.0
+        ret_5d = (reg_close / float(c.iloc[-6]) - 1.0) * 100.0 if len(c) >= 6 else 0.0
         rs_vs_qqq = ret_5d - qqq_5d_return
         rsi, rsi_3d = compute_rsi_metrics(c)
         ma200_dist, dd_52w = ma200_dist_and_dd(c)
@@ -524,7 +535,6 @@ def scan_watchlist(tickers_tuple: tuple, qqq_5d_return: float) -> pd.DataFrame:
         elif rsi_3d <= -2.0:
             rank_score -= 10.0
 
-        # Reward strong intraday dip-buying (closing in top 30% of daily range)
         if wick_pct >= 70.0:
             rank_score += 6.0
         elif wick_pct <= 25.0:
@@ -538,8 +548,9 @@ def scan_watchlist(tickers_tuple: tuple, qqq_5d_return: float) -> pd.DataFrame:
         rows.append(
             {
                 "Ticker": t,
-                "Price": round(last_price, 2),
-                "5D %": round(ret_5d, 1),
+                "Close": round(reg_close, 2),
+                "Ext. Price": round(ext_price, 2),
+                "Ext. Gap": round(ext_gap_pct, 2),
                 "RS vs QQQ": round(rs_vs_qqq, 1),
                 "RSI": round(rsi, 1),
                 "Momentum": mom_tag,
@@ -554,6 +565,27 @@ def scan_watchlist(tickers_tuple: tuple, qqq_5d_return: float) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame()
     return pd.DataFrame(rows).sort_values("RankScore", ascending=False).reset_index(drop=True)
+
+
+def evaluate_ext_reading(row: pd.Series, macro_score: float, nq_chg: float) -> str:
+    """Flag whether extended-hours movement is unusual vs. NQ futures, RSI, and macro."""
+    gap = float(row["Ext. Gap"])
+    rsi = float(row["RSI"])
+    rel_gap = gap - nq_chg
+
+    if abs(gap) < 0.4:
+        return "— Quiet"
+    if abs(rel_gap) >= 2.5:
+        return "⚡ Unusual Surge (News)" if gap > 0 else "🚨 Unusual Drop (News)"
+    if gap >= 2.0 and macro_score < 55:
+        return "⚠️ Don't Chase Gap"
+    if gap <= -2.0 and macro_score >= 55:
+        return "🎯 Overnight Flush"
+    if gap >= 1.0 and rsi < 35:
+        return "↗ Relief Bounce"
+    if gap <= -1.0 and rsi > 65:
+        return "↘ Cooling Off"
+    return "≈ Tracking Macro"
 
 
 def assign_action_signal(row: pd.Series, macro_score: float) -> str:
@@ -926,6 +958,7 @@ with top_c2:
 
 with st.spinner("Pulling 1Y live macro, term structure & volume feeds..."):
     live = fetch_live_market_data()
+    tape_snapshot = fetch_live_intraday_tape()
 
 if st.session_state.pop("just_refreshed", False):
     st.toast(f"All live feeds synced at {live['timestamp']}", icon="⚡")
@@ -1066,32 +1099,44 @@ if greens:
 
 st.divider()
 
-# Curated Watchlist Scanner
+# Curated Watchlist Scanner (with Extended-Hours & Anomaly Reading)
 st.subheader("🎯 Curated Watchlist Scanner")
-st.caption("Wick % = where price sits in today's High–Low range (>70% signals active dip-buying).")
+st.caption("Compares Pre/After-Hours price against Regular Close, NQ Futures, RSI, and your Multimeter Score.")
 
 default_wl = "QQQ, SMH, NVDA, AMD, AVGO, MU, META, PLTR, ORCL, MRVL"
 wl_input = st.text_input("Watchlist Tickers (comma-separated)", value=default_wl)
 tickers_list = tuple(dict.fromkeys([t.strip().upper() for t in wl_input.split(",") if t.strip()]))
 
-with st.spinner("Scanning watchlist setups..."):
+with st.spinner("Scanning watchlist setups & extended hours..."):
     wl_df = scan_watchlist(tickers_list, live["qqq_5d"])
 
 if wl_df.empty:
     st.warning("No valid ticker data returned. Check your ticker symbols.")
 else:
+    wl_df["Ext. Reading"] = wl_df.apply(
+        lambda r: evaluate_ext_reading(r, result["score"], tape_snapshot["nq_chg"]), axis=1
+    )
     wl_df["Action"] = wl_df.apply(lambda r: assign_action_signal(r, result["score"]), axis=1)
-    display_cols = ["Ticker", "Price", "5D %", "RS vs QQQ", "RSI", "Momentum", "Wick %", "vs 200D MA", "Setup", "Action"]
+    display_cols = [
+        "Ticker",
+        "Close",
+        "Ext. Price",
+        "Ext. Gap",
+        "Ext. Reading",
+        "RSI",
+        "Momentum",
+        "vs 200D MA",
+        "Action",
+    ]
     st.dataframe(
         wl_df[display_cols],
         use_container_width=True,
         hide_index=True,
         column_config={
-            "Price": st.column_config.NumberColumn(format="$%.2f"),
-            "5D %": st.column_config.NumberColumn(format="%+.1f%%"),
-            "RS vs QQQ": st.column_config.NumberColumn(format="%+.1f%%"),
+            "Close": st.column_config.NumberColumn(format="$%.2f"),
+            "Ext. Price": st.column_config.NumberColumn(format="$%.2f"),
+            "Ext. Gap": st.column_config.NumberColumn(format="%+.2f%%"),
             "RSI": st.column_config.NumberColumn(format="%.1f"),
-            "Wick %": st.column_config.NumberColumn(format="%.0f%%"),
             "vs 200D MA": st.column_config.NumberColumn(format="%+.1f%%"),
         },
     )
