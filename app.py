@@ -10,7 +10,7 @@ import yfinance as yf
 # PAGE CONFIG & MOBILE-FIRST TERMINAL STYLING
 # -----------------------------------------------------------------------------
 st.set_page_config(
-    page_title="Rebound Pulse // Buying Guide",
+    page_title="Rebound Pulse // Live Timing Terminal",
     page_icon="⚡",
     layout="centered",
     initial_sidebar_state="collapsed",
@@ -20,7 +20,7 @@ st.markdown(
     """
     <style>
         .block-container {
-            padding-top: 1.2rem;
+            padding-top: 1.1rem;
             padding-bottom: 2.5rem;
             max-width: 780px;
         }
@@ -38,6 +38,13 @@ st.markdown(
             margin-top: 0;
             margin-bottom: 0.4rem;
             line-height: 1.2;
+        }
+        .tape-box {
+            border-radius: 10px;
+            padding: 0.75rem 0.9rem;
+            margin-bottom: 0.9rem;
+            border: 1px solid rgba(56, 189, 248, 0.25);
+            background-color: rgba(15, 23, 42, 0.55);
         }
         .regime-pill {
             display: inline-block;
@@ -118,7 +125,6 @@ def get_sydney_time_str() -> str:
 
 
 def extract_field_series(df: pd.DataFrame, field: str, ticker: str) -> pd.Series:
-    """Safely extract Close or Volume series across yfinance MultiIndex formats."""
     if df.empty:
         return pd.Series(dtype=float)
     if isinstance(df.columns, pd.MultiIndex):
@@ -132,7 +138,6 @@ def extract_field_series(df: pd.DataFrame, field: str, ticker: str) -> pd.Series
 
 
 def compute_rsi_metrics(series: pd.Series, period: int = 14) -> tuple[float, float]:
-    """Return (latest 14D RSI, 3-day RSI slope change)."""
     clean = series.dropna()
     if len(clean) < period + 5:
         return 50.0, 0.0
@@ -145,13 +150,10 @@ def compute_rsi_metrics(series: pd.Series, period: int = 14) -> tuple[float, flo
     rsi = (100 - (100 / (1 + rs))).dropna()
     if len(rsi) < 4:
         return 50.0, 0.0
-    latest = float(rsi.iloc[-1])
-    slope_3d = float(rsi.iloc[-1] - rsi.iloc[-4])
-    return latest, slope_3d
+    return float(rsi.iloc[-1]), float(rsi.iloc[-1] - rsi.iloc[-4])
 
 
 def compute_red_vol_ratio(close_s: pd.Series, vol_s: pd.Series) -> float:
-    """Compare latest red-day volume (within last 5 sessions) to 20-day average volume."""
     aligned = pd.concat([close_s.rename("c"), vol_s.rename("v")], axis=1).dropna()
     if len(aligned) < 22:
         return 1.0
@@ -162,7 +164,7 @@ def compute_red_vol_ratio(close_s: pd.Series, vol_s: pd.Series) -> float:
     recent["chg"] = aligned["c"].diff().iloc[-5:]
     red_days = recent[recent["chg"] < 0]
     if red_days.empty:
-        return 0.75  # No recent red days -> selling pressure has dried up
+        return 0.75
     return float(red_days["v"].iloc[-1] / avg_vol_20)
 
 
@@ -173,17 +175,134 @@ def ma200_dist_and_dd(s: pd.Series):
     ma200 = float(s.rolling(window).mean().iloc[-1])
     last = float(s.iloc[-1])
     high_52w = float(s.max())
-    dist_ma200 = (last - ma200) / ma200 * 100.0
-    dd_52w = (last - high_52w) / high_52w * 100.0
-    return dist_ma200, dd_52w
+    return (last - ma200) / ma200 * 100.0, (last - high_52w) / high_52w * 100.0
+
+
+def compute_session_vwap_and_wick(df_15m: pd.DataFrame, ticker: str) -> tuple[float, float, float]:
+    """Return (last_price, % distance from latest session VWAP, % position in session High-Low range)."""
+    c = extract_field_series(df_15m, "Close", ticker)
+    h = extract_field_series(df_15m, "High", ticker)
+    l = extract_field_series(df_15m, "Low", ticker)
+    v = extract_field_series(df_15m, "Volume", ticker)
+    aligned = pd.concat([c.rename("c"), h.rename("h"), l.rename("l"), v.rename("v")], axis=1).dropna()
+    if aligned.empty:
+        return 0.0, 0.0, 50.0
+
+    # Filter to the most recent trading date in the 15m feed
+    last_date = aligned.index[-1].date()
+    sess = aligned[aligned.index.date == last_date]
+    if sess.empty:
+        sess = aligned.iloc[-26:]
+
+    last_price = float(sess["c"].iloc[-1])
+    tp = (sess["h"] + sess["l"] + sess["c"]) / 3.0
+    vol_sum = float(sess["v"].sum())
+    vwap = float((tp * sess["v"]).sum() / vol_sum) if vol_sum > 0 else float(tp.mean())
+    vwap_dist_pct = (last_price - vwap) / vwap * 100.0 if vwap > 0 else 0.0
+
+    sess_high = float(sess["h"].max())
+    sess_low = float(sess["l"].min())
+    wick_pos = (
+        (last_price - sess_low) / (sess_high - sess_low) * 100.0
+        if sess_high > sess_low
+        else 50.0
+    )
+    return last_price, round(vwap_dist_pct, 2), round(wick_pos, 0)
 
 
 # -----------------------------------------------------------------------------
-# LIVE MACRO DATA FETCH
+# LIVE 24H FUTURES & INTRADAY TAPE (AUTO-REFRESHED EVERY 60s)
+# -----------------------------------------------------------------------------
+@st.cache_data(ttl=55, show_spinner=False)
+def fetch_live_intraday_tape() -> dict:
+    """Fetch near-24/5 futures, 24/7 BTC, and 15m intraday QQQ/SMH/HYG/IEF."""
+    tape_tickers = ["NQ=F", "ES=F", "GC=F", "BTC-USD", "QQQ", "SMH", "HYG", "IEF"]
+    raw_15m = yf.download(
+        tape_tickers,
+        period="5d",
+        interval="15m",
+        prepost=True,
+        auto_adjust=True,
+        progress=False,
+        threads=True,
+    )
+
+    def tape_quote(t: str) -> tuple[float, float]:
+        s = extract_field_series(raw_15m, "Close", t)
+        if len(s) < 2:
+            return 0.0, 0.0
+        last = float(s.iloc[-1])
+        # Compare against 24 hours (~96 15m bars) or earliest available
+        prev_idx = max(0, len(s) - 96)
+        prev = float(s.iloc[prev_idx])
+        chg_pct = (last / prev - 1.0) * 100.0 if prev > 0 else 0.0
+        return round(last, 2), round(chg_pct, 2)
+
+    nq_p, nq_chg = tape_quote("NQ=F")
+    es_p, es_chg = tape_quote("ES=F")
+    gc_p, gc_chg = tape_quote("GC=F")
+    btc_p, btc_chg = tape_quote("BTC-USD")
+
+    qqq_p, qqq_vwap_dist, qqq_wick = compute_session_vwap_and_wick(raw_15m, "QQQ")
+    smh_p, smh_vwap_dist, smh_wick = compute_session_vwap_and_wick(raw_15m, "SMH")
+
+    # Live intraday HYG / IEF credit stress proxy (1-day change in ratio)
+    hyg = extract_field_series(raw_15m, "Close", "HYG")
+    ief = extract_field_series(raw_15m, "Close", "IEF")
+    cred_df = pd.concat([hyg.rename("hyg"), ief.rename("ief")], axis=1).dropna()
+    if len(cred_df) >= 20:
+        ratio = cred_df["hyg"] / cred_df["ief"]
+        prev_idx = max(0, len(ratio) - 32)
+        hyg_ief_chg = round((float(ratio.iloc[-1]) / float(ratio.iloc[prev_idx]) - 1.0) * 100.0, 2)
+    else:
+        hyg_ief_chg = 0.0
+
+    return {
+        "synced_at": get_sydney_time_str(),
+        "nq_p": nq_p,
+        "nq_chg": nq_chg,
+        "es_p": es_p,
+        "es_chg": es_chg,
+        "gc_p": gc_p,
+        "gc_chg": gc_chg,
+        "btc_p": btc_p,
+        "btc_chg": btc_chg,
+        "qqq_vwap_dist": qqq_vwap_dist,
+        "qqq_wick": qqq_wick,
+        "smh_vwap_dist": smh_vwap_dist,
+        "smh_wick": smh_wick,
+        "hyg_ief_chg": hyg_ief_chg,
+    }
+
+
+@st.fragment(run_every=60)
+def render_live_24h_tape():
+    tape = fetch_live_intraday_tape()
+    st.markdown('<div class="tape-box">', unsafe_allow_html=True)
+    st.caption(f"🟢 LIVE 24H FUTURES & INTRADAY PULSE (Auto-updates every 60s • {tape['synced_at']})")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Nasdaq Fut (NQ)", f"{tape['nq_p']:,.0f}", f"{tape['nq_chg']:+.2f}%")
+    c2.metric("S&P Fut (ES)", f"{tape['es_p']:,.0f}", f"{tape['es_chg']:+.2f}%")
+    c3.metric("Gold Fut (GC)", f"${tape['gc_p']:,.0f}", f"{tape['gc_chg']:+.2f}%")
+    c4.metric("Bitcoin (24/7)", f"${tape['btc_p']:,.0f}", f"{tape['btc_chg']:+.2f}%")
+
+    i1, i2, i3 = st.columns(3)
+    qqq_vwap_tag = "Above VWAP" if tape["qqq_vwap_dist"] >= 0 else "Below VWAP"
+    smh_vwap_tag = "Above VWAP" if tape["smh_vwap_dist"] >= 0 else "Below VWAP"
+    cred_tag = "Risk-On (Tightening)" if tape["hyg_ief_chg"] >= 0 else "Stress (Widening)"
+
+    i1.metric("QQQ Intraday VWAP", f"{tape['qqq_vwap_dist']:+.2f}%", f"{qqq_vwap_tag} • Wick {tape['qqq_wick']:.0f}%")
+    i2.metric("SMH Intraday VWAP", f"{tape['smh_vwap_dist']:+.2f}%", f"{smh_vwap_tag} • Wick {tape['smh_wick']:.0f}%")
+    i3.metric("Live Credit (HYG/IEF)", f"{tape['hyg_ief_chg']:+.2f}%", cred_tag)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+# -----------------------------------------------------------------------------
+# LIVE MACRO DATA FETCH (1-YEAR DAILY + VIX3M + FRED)
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_live_market_data() -> dict:
-    tickers = ["^TNX", "^VIX", "QQQ", "SMH", "RSP", "GC=F", "DX-Y.NYB", "BTC-USD"]
+    tickers = ["^TNX", "^VIX", "^VIX3M", "QQQ", "SMH", "RSP", "GC=F", "DX-Y.NYB", "BTC-USD"]
     raw = yf.download(
         tickers,
         period="1y",
@@ -195,6 +314,7 @@ def fetch_live_market_data() -> dict:
 
     tnx = extract_field_series(raw, "Close", "^TNX")
     vix = extract_field_series(raw, "Close", "^VIX")
+    vix3m = extract_field_series(raw, "Close", "^VIX3M")
     qqq = extract_field_series(raw, "Close", "QQQ")
     smh = extract_field_series(raw, "Close", "SMH")
     qqq_vol = extract_field_series(raw, "Volume", "QQQ")
@@ -215,14 +335,17 @@ def fetch_live_market_data() -> dict:
     else:
         yield_10y, yield_5d_chg = 4.50, 0.0
 
-    # 2. VIX level & trajectory
+    # 2. VIX Level, Trajectory & Term Structure (VIX / VIX3M)
     vix_val = float(vix.iloc[-1]) if len(vix) else 20.0
+    vix3m_val = float(vix3m.iloc[-1]) if len(vix3m) else vix_val * 1.05
+    vix_ratio = round(vix_val / vix3m_val, 2) if vix3m_val > 0 else 0.95
+
     if len(vix) >= 5:
         vix_5d_max = float(vix.iloc[-5:].max())
         vix_3d_chg = float(vix.iloc[-1] - vix.iloc[-3])
-        if vix_val >= vix_5d_max * 0.97 and vix_3d_chg > 0.5:
+        if (vix_val >= vix_5d_max * 0.97 and vix_3d_chg > 0.5) or vix_ratio >= 1.08:
             vix_state = "Spiking"
-        elif vix_val < vix_5d_max * 0.92 and vix_3d_chg < -0.5:
+        elif vix_val < vix_5d_max * 0.92 and vix_3d_chg < -0.5 and vix_ratio < 1.02:
             vix_state = "Rolling Over"
         else:
             vix_state = "Peaking / Stalling"
@@ -302,6 +425,7 @@ def fetch_live_market_data() -> dict:
         "yield_10y": round(yield_10y, 2),
         "yield_5d_chg": round(yield_5d_chg, 2),
         "vix": round(vix_val, 2),
+        "vix_ratio": vix_ratio,
         "vix_state": vix_state,
         "qqq_rsi": round(qqq_rsi, 1),
         "smh_rsi": round(smh_rsi, 1),
@@ -327,7 +451,7 @@ def fetch_live_market_data() -> dict:
 
 
 # -----------------------------------------------------------------------------
-# WATCHLIST SCANNER ENGINE (WITH MOMENTUM CURL)
+# WATCHLIST SCANNER ENGINE (WITH MOMENTUM CURL + INTRADAY WICK REVERSAL)
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=300, show_spinner=False)
 def scan_watchlist(tickers_tuple: tuple, qqq_5d_return: float) -> pd.DataFrame:
@@ -348,15 +472,25 @@ def scan_watchlist(tickers_tuple: tuple, qqq_5d_return: float) -> pd.DataFrame:
     index_etfs = {"QQQ", "SMH", "SPY", "VOO", "SOXX", "IVV", "RSP"}
 
     for t in tickers:
-        s = extract_field_series(raw, "Close", t)
-        if len(s) < 20:
+        c = extract_field_series(raw, "Close", t)
+        h = extract_field_series(raw, "High", t)
+        l = extract_field_series(raw, "Low", t)
+        if len(c) < 20:
             continue
 
-        last_price = float(s.iloc[-1])
-        ret_5d = (last_price / float(s.iloc[-6]) - 1.0) * 100.0 if len(s) >= 6 else 0.0
+        last_price = float(c.iloc[-1])
+        day_h = float(h.iloc[-1]) if len(h) else last_price
+        day_l = float(l.iloc[-1]) if len(l) else last_price
+        wick_pct = (
+            (last_price - day_l) / (day_h - day_l) * 100.0
+            if day_h > day_l
+            else 50.0
+        )
+
+        ret_5d = (last_price / float(c.iloc[-6]) - 1.0) * 100.0 if len(c) >= 6 else 0.0
         rs_vs_qqq = ret_5d - qqq_5d_return
-        rsi, rsi_3d = compute_rsi_metrics(s)
-        ma200_dist, dd_52w = ma200_dist_and_dd(s)
+        rsi, rsi_3d = compute_rsi_metrics(c)
+        ma200_dist, dd_52w = ma200_dist_and_dd(c)
 
         if rsi_3d >= 1.5:
             mom_tag = "↗ Curling"
@@ -385,11 +519,16 @@ def scan_watchlist(tickers_tuple: tuple, qqq_5d_return: float) -> pd.DataFrame:
         elif rsi > 65:
             rank_score -= 10.0
 
-        # Reward curling up from oversold; penalize still diving
         if rsi <= 48 and rsi_3d >= 1.5:
             rank_score += 10.0
         elif rsi_3d <= -2.0:
             rank_score -= 10.0
+
+        # Reward strong intraday dip-buying (closing in top 30% of daily range)
+        if wick_pct >= 70.0:
+            rank_score += 6.0
+        elif wick_pct <= 25.0:
+            rank_score -= 5.0
 
         if -3.0 <= ma200_dist <= 6.0:
             rank_score += 12.0
@@ -404,8 +543,8 @@ def scan_watchlist(tickers_tuple: tuple, qqq_5d_return: float) -> pd.DataFrame:
                 "RS vs QQQ": round(rs_vs_qqq, 1),
                 "RSI": round(rsi, 1),
                 "Momentum": mom_tag,
+                "Wick %": round(wick_pct, 0),
                 "vs 200D MA": round(ma200_dist, 1),
-                "52W DD": round(dd_52w, 1),
                 "Setup": setup,
                 "IsETF": t in index_etfs,
                 "RankScore": round(clamp(rank_score, 0, 100), 1),
@@ -448,6 +587,7 @@ def assign_action_signal(row: pd.Series, macro_score: float) -> str:
 def evaluate_rebound(
     yield_10y: float,
     vix: float,
+    vix_ratio: float,
     vix_state: str,
     gold_corr: float,
     hy_spread: float,
@@ -479,21 +619,21 @@ def evaluate_rebound(
         msg_y = f"10Y Yield ({yield_10y:.2f}%) is in the 5% danger zone — directly capping AI & semi rallies."
     components.append(("10Y Treasury Yield", pts_y, max_y, status_y, msg_y, "LT"))
 
-    # 2. VIX Level & Trajectory (15 pts)
+    # 2. VIX Level, Trajectory & Term Structure (15 pts)
     max_v = 15.0
-    if vix_state == "Rolling Over":
-        pts_v = 15.0 if vix >= 22 else 12.0
+    if vix_state == "Rolling Over" and vix_ratio < 1.00:
+        pts_v = 15.0 if vix >= 22 else 12.5
         status_v = "GREEN LIGHT"
-        msg_v = f"VIX ({vix:.1f}) is rolling over — panic selling is exhausting."
-    elif vix_state == "Peaking / Stalling":
-        pts_v = 9.0 if vix >= 25 else 7.5
+        msg_v = f"VIX ({vix:.1f}) is rolling over with healthy term structure (VIX/VIX3M = {vix_ratio:.2f})."
+    elif vix_state == "Peaking / Stalling" or (vix_state == "Rolling Over" and vix_ratio >= 1.00):
+        pts_v = 8.5 if vix_ratio < 1.05 else 6.0
         status_v = "CAUTION"
-        msg_v = f"VIX ({vix:.1f}) is stalling. Wait for a lower high to confirm fear has peaked."
+        msg_v = f"VIX ({vix:.1f}, ratio {vix_ratio:.2f}) is stalling. Watch for VIX/VIX3M to snap cleanly below 1.00."
     else:
-        pts_v = 2.5 if vix >= 30 else 4.0
+        pts_v = 2.0 if vix_ratio >= 1.05 else 3.5
         status_v = "CRITICAL BLOCKER"
-        msg_v = f"VIX ({vix:.1f}) is actively spiking — high risk of catching a falling knife."
-    components.append(("VIX Fear Trajectory", pts_v, max_v, status_v, msg_v, "ST"))
+        msg_v = f"VIX ({vix:.1f}) is spiking in backwardation (VIX/VIX3M = {vix_ratio:.2f}) — active panic."
+    components.append(("VIX & Term Structure", pts_v, max_v, status_v, msg_v, "ST"))
 
     # 3. Gold / Tech Correlation (13 pts)
     max_g = 13.0
@@ -516,7 +656,7 @@ def evaluate_rebound(
         msg_hy = f"HY Credit Spreads ({hy_spread:.2f}%) are calm — no systemic credit freeze."
     elif hy_spread <= 4.75:
         pts_hy, status_hy = 6.5, "CAUTION"
-        msg_hy = f"HY Credit Spreads ({hy_spread:.2f}%) are widening — watch for corporate funding stress."
+        msg_hy = f"HY Credit Spreads ({hy_spread:.2f}%) are widening — watch live HYG/IEF ratio above."
     else:
         pts_hy = max(0.0, 3.0 - (hy_spread - 4.75) * 1.5)
         status_hy = "CRITICAL BLOCKER"
@@ -606,11 +746,11 @@ def evaluate_rebound(
     if total_score < 35:
         regime, color, bg = "FALLING KNIFE", "#ef4444", "rgba(239, 68, 68, 0.16)"
         playbook_action = "🛑 HOLD CASH (0% Deployed)"
-        playbook_note = "Forced selling and macro stress are still active. Keep powder dry until VIX stalls and Gold stops dropping with tech."
+        playbook_note = "Forced selling and macro stress are still active. Keep powder dry until VIX/VIX3M snaps under 1.00 and Gold decouples."
     elif total_score < 55:
         regime, color, bg = "DEAD-CAT BOUNCE ZONE", "#f59e0b", "rgba(245, 158, 11, 0.16)"
         playbook_action = "🟡 SCOUT ONLY (10%–15% Starter Tranche)"
-        playbook_note = "Short-term snapbacks are likely, but macro blockers remain. Only take small starter nibbles on red days or conservative OTM cash-secured puts."
+        playbook_note = "Short-term snapbacks are likely, but macro blockers remain. Only take small starter nibbles on red days when QQQ reclaims VWAP."
     elif total_score < 75:
         regime, color, bg = "EARLY ACCUMULATION", "#38bdf8", "rgba(56, 189, 248, 0.16)"
         playbook_action = "🔵 SCALE IN (30%–50% Tranche)"
@@ -618,7 +758,7 @@ def evaluate_rebound(
     else:
         regime, color, bg = "HIGH-CONVICTION REBOUND", "#10b981", "rgba(16, 185, 129, 0.16)"
         playbook_action = "🟢 AGGRESSIVE DEPLOY (Remaining Cash)"
-        playbook_note = "Yields, volatility, breadth, and institutional support are aligned for a sustained multi-month recovery."
+        playbook_note = "Yields, volatility term structure, breadth, and institutional support are aligned for a sustained multi-month recovery."
 
     diagnostics = [
         {
@@ -689,13 +829,17 @@ def render_multimeter(score: float, color: str) -> go.Figure:
 # -----------------------------------------------------------------------------
 # MAIN UI
 # -----------------------------------------------------------------------------
-st.markdown('<div class="pulse-header">REBOUND PULSE // LIVE BUYING GUIDE</div>', unsafe_allow_html=True)
+st.markdown('<div class="pulse-header">REBOUND PULSE // LIVE 24H TIMING TERMINAL</div>', unsafe_allow_html=True)
 st.markdown('<div class="pulse-title">Market Rebound Multimeter</div>', unsafe_allow_html=True)
+
+# 1. Auto-refreshing 60-second Live 24H Futures & Intraday Pulse
+render_live_24h_tape()
 
 SIM_KEYS = [
     "sim_mode",
     "s_yield",
     "s_vix",
+    "s_vix_ratio",
     "s_vix_state",
     "s_rsi",
     "s_mom_state",
@@ -711,6 +855,7 @@ PRESETS = {
     "Goldilocks Bottom": {
         "s_yield": 3.95,
         "s_vix": 24.0,
+        "s_vix_ratio": 0.94,
         "s_vix_state": "Rolling Over",
         "s_rsi": 34.0,
         "s_mom_state": "Curling Up",
@@ -724,6 +869,7 @@ PRESETS = {
     "Dead-Cat Bounce": {
         "s_yield": 4.90,
         "s_vix": 28.5,
+        "s_vix_ratio": 1.03,
         "s_vix_state": "Peaking / Stalling",
         "s_rsi": 36.0,
         "s_mom_state": "Stalling / Drying Up",
@@ -737,6 +883,7 @@ PRESETS = {
     "2020-Style Freeze": {
         "s_yield": 5.20,
         "s_vix": 48.0,
+        "s_vix_ratio": 1.18,
         "s_vix_state": "Spiking",
         "s_rsi": 22.0,
         "s_mom_state": "Diving (Heavy Vol)",
@@ -751,6 +898,7 @@ PRESETS = {
 
 
 def reset_and_refresh_live():
+    fetch_live_intraday_tape.clear()
     fetch_live_market_data.clear()
     scan_watchlist.clear()
     for k in SIM_KEYS:
@@ -771,16 +919,16 @@ with top_c1:
     sim_mode = st.toggle("🎛️ What-If Simulator Mode", key="sim_mode")
 with top_c2:
     st.button(
-        "🔄 Reset & Refresh Live",
+        "🔄 Reset & Refresh All",
         on_click=reset_and_refresh_live,
         use_container_width=True,
     )
 
-with st.spinner("Pulling 1Y live macro, volume & technical feeds (Yahoo Finance + FRED)..."):
+with st.spinner("Pulling 1Y live macro, term structure & volume feeds..."):
     live = fetch_live_market_data()
 
 if st.session_state.pop("just_refreshed", False):
-    st.toast(f"Live feeds & watchlist synced at {live['timestamp']}", icon="⚡")
+    st.toast(f"All live feeds synced at {live['timestamp']}", icon="⚡")
 
 if sim_mode:
     with st.expander("Adjust Indicators & Scenario Presets", expanded=True):
@@ -794,6 +942,9 @@ if sim_mode:
         )
         s_vix = st.slider(
             "VIX Index", 10.0, 65.0, clamp(live["vix"], 10.0, 65.0), 0.5, key="s_vix"
+        )
+        s_vix_ratio = st.slider(
+            "VIX / VIX3M Term Structure Ratio (>1.0 = Panic)", 0.70, 1.40, clamp(live["vix_ratio"], 0.70, 1.40), 0.01, key="s_vix_ratio"
         )
         vix_opts = ["Spiking", "Peaking / Stalling", "Rolling Over"]
         s_vix_state = (
@@ -839,6 +990,7 @@ if sim_mode:
 else:
     s_yield = live["yield_10y"]
     s_vix = live["vix"]
+    s_vix_ratio = live["vix_ratio"]
     s_vix_state = live["vix_state"]
     s_rsi = live["tech_rsi"]
     s_mom_state = live["mom_state"]
@@ -850,7 +1002,7 @@ else:
     s_btc_dd = live["btc_dd_pct"]
 
 result = evaluate_rebound(
-    s_yield, s_vix, s_vix_state, s_corr, s_hy, s_ma200, s_breadth, s_rsi, s_mom_state, s_dxy, s_btc_dd
+    s_yield, s_vix, s_vix_ratio, s_vix_state, s_corr, s_hy, s_ma200, s_breadth, s_rsi, s_mom_state, s_dxy, s_btc_dd
 )
 
 # Regime Pill & Gauge
@@ -890,7 +1042,7 @@ blockers = [d for d in result["diagnostics"] if d["status"] != "GREEN LIGHT"]
 greens = [d for d in result["diagnostics"] if d["status"] == "GREEN LIGHT"]
 
 if not blockers:
-    st.success("All 9 macro, breadth, and exhaustion indicators are aligned for a sustained rebound.")
+    st.success("All 9 macro, term-structure, breadth, and exhaustion indicators are aligned.")
 else:
     for b in blockers:
         border_col = "#ef4444" if b["status"] == "CRITICAL BLOCKER" else "#f59e0b"
@@ -914,11 +1066,9 @@ if greens:
 
 st.divider()
 
-# -----------------------------------------------------------------------------
-# CURATED WATCHLIST SCANNER (TIED TO MULTIMETER SCORE + MOMENTUM CURL)
-# -----------------------------------------------------------------------------
+# Curated Watchlist Scanner
 st.subheader("🎯 Curated Watchlist Scanner")
-st.caption("Ranked by Relative Strength vs. QQQ, RSI Curl, and 200D MA support. Action signals adapt to the Multimeter Score.")
+st.caption("Wick % = where price sits in today's High–Low range (>70% signals active dip-buying).")
 
 default_wl = "QQQ, SMH, NVDA, AMD, AVGO, MU, META, PLTR, ORCL, MRVL"
 wl_input = st.text_input("Watchlist Tickers (comma-separated)", value=default_wl)
@@ -931,7 +1081,7 @@ if wl_df.empty:
     st.warning("No valid ticker data returned. Check your ticker symbols.")
 else:
     wl_df["Action"] = wl_df.apply(lambda r: assign_action_signal(r, result["score"]), axis=1)
-    display_cols = ["Ticker", "Price", "5D %", "RS vs QQQ", "RSI", "Momentum", "vs 200D MA", "Setup", "Action"]
+    display_cols = ["Ticker", "Price", "5D %", "RS vs QQQ", "RSI", "Momentum", "Wick %", "vs 200D MA", "Setup", "Action"]
     st.dataframe(
         wl_df[display_cols],
         use_container_width=True,
@@ -941,6 +1091,7 @@ else:
             "5D %": st.column_config.NumberColumn(format="%+.1f%%"),
             "RS vs QQQ": st.column_config.NumberColumn(format="%+.1f%%"),
             "RSI": st.column_config.NumberColumn(format="%.1f"),
+            "Wick %": st.column_config.NumberColumn(format="%.0f%%"),
             "vs 200D MA": st.column_config.NumberColumn(format="%+.1f%%"),
         },
     )
@@ -951,7 +1102,7 @@ st.divider()
 st.subheader("📡 Live Market Telemetry")
 m1, m2, m3 = st.columns(3)
 m1.metric("10Y Yield (^TNX)", f"{s_yield:.2f}%", f"{live['yield_5d_chg']:+.2f}% (5D)", delta_color="inverse")
-m2.metric("VIX", f"{s_vix:.1f}", s_vix_state)
+m2.metric("VIX / VIX3M", f"{s_vix:.1f}", f"Ratio {s_vix_ratio:.2f} • {s_vix_state}")
 m3.metric("200D MA Dist", f"{s_ma200:+.1f}%", f"52W DD: {live['avg_dd_52w']:.1f}%")
 
 m4, m5, m6 = st.columns(3)
@@ -967,8 +1118,8 @@ m9.metric("BTC 5D Drawdown", f"-{s_btc_dd:.1f}%", "Cooled" if s_btc_dd <= 4.0 el
 fred_note = f"FRED ({live['fred_last_date']})" if live["fred_ok"] else "FRED fallback"
 st.markdown(
     f'<div class="small-muted">'
-    f'Last sync: <b>{live["timestamp"]}</b> • Red-day Vol vs 20D Avg: {live["red_vol_ratio"]:.2f}x<br>'
-    f'Latest market candles: Yahoo Finance ({live["yf_last_date"]}) • {fred_note} • Auto-cache: 5 min'
+    f'Last full sync: <b>{live["timestamp"]}</b> • Red-day Vol vs 20D Avg: {live["red_vol_ratio"]:.2f}x<br>'
+    f'Latest daily candles: Yahoo Finance ({live["yf_last_date"]}) • {fred_note} • Top tape auto-refreshes every 60s'
     f'</div>',
     unsafe_allow_html=True,
 )
