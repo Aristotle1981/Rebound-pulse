@@ -943,7 +943,7 @@ def fetch_ticker_news(ticker: str, max_items: int = 6) -> list[dict]:
     return unique[:max_items]
 
 
-def items: list[dict], empty_msg: str = "No recent headlines found."):
+def render_news_list(items: list[dict], empty_msg: str = "No recent headlines found."):
     if not items:
         st.caption(empty_msg)
         return
