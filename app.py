@@ -1251,9 +1251,9 @@ with tab_news:
 
     with n_macro:
         render_news_list(
-        fetch_breaking_macro_news(max_items=10),
-        "Could not load breaking macro headlines right now.",
-    )
+            fetch_breaking_macro_news(max_items=10),
+            "Could not load breaking macro headlines right now.",
+        )
 
     with n_movers:
         if not wl_df.empty and "Ext. Reading" in wl_df.columns:
