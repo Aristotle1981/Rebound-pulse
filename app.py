@@ -943,7 +943,7 @@ def fetch_ticker_news(ticker: str, max_items: int = 6) -> list[dict]:
     return unique[:max_items]
 
 
-def render_news_list(items: list[dict], empty_msg: str = "No recent headlines found."):
+def items: list[dict], empty_msg: str = "No recent headlines found."):
     if not items:
         st.caption(empty_msg)
         return
@@ -1250,7 +1250,7 @@ with tab_news:
     n_macro, n_movers, n_tick, n_cal = st.tabs(["🏛️ Macro", "⚡ Unusual Movers", "🎯 Ticker", "📅 Earnings Radar"])
 
     with n_macro:
-    render_news_list(
+        render_news_list(
         fetch_breaking_macro_news(max_items=10),
         "Could not load breaking macro headlines right now.",
     )
