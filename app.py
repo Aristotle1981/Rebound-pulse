@@ -1,4 +1,5 @@
 import datetime
+from email.utils import parsedate_to_datetime
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -824,65 +825,122 @@ def assign_action_signal(row: pd.Series, macro_score: float) -> str:
 
 
 # -----------------------------------------------------------------------------
-# NEWS HELPERS
+# REAL-TIME NEWS ENGINE (MULTI-SOURCE + STRICT NEWEST-FIRST SORTING)
 # -----------------------------------------------------------------------------
 def tag_headline(title: str) -> str:
     t = title.lower()
+    if any(k in t for k in ("tariff", "trump", "china", "trade war", "war", "oil", "geopolitic", "sanction", "export")):
+        return "🌍 Tariffs/Geo"
     if any(k in t for k in ("earnings", "revenue", "eps", "guidance", "quarter", "beats", "misses")):
         return "📊 Earnings"
     if any(k in t for k in ("fed", "powell", "cpi", "ppi", "inflation", "yield", "treasury", "rate cut", "fomc", "payroll")):
         return "🏛️ Fed/Rates"
-    if any(k in t for k in ("tariff", "china", "war", "oil", "geopolitic", "sanction")):
-        return "🌍 Geopolitics"
     if any(k in t for k in ("upgrade", "downgrade", "price target", "analyst", "rating")):
         return "📈 Analyst"
-    if any(k in t for k in ("ai", "chip", "semiconductor", "gpu", "data center", "hbm", "foundry")):
+    if any(k in t for k in ("ai", "chip", "semiconductor", "gpu", "nvidia", "data center", "hbm", "foundry")):
         return "🤖 AI/Semis"
     return "📰 Market"
 
 
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_google_rss(query: str, max_items: int = 6) -> list[dict]:
-    url = f"https://news.google.com/rss/search?q={urllib.parse.quote(query)}&hl=en-US&gl=US&ceid=US:en"
+def format_age(dt: datetime.datetime) -> str:
+    """Convert UTC timestamp into a clean relative age like '18m ago' or '3h ago'."""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    diff = max(0, int((now - dt).total_seconds()))
+    if diff < 3600:
+        return f"{max(1, diff // 60)}m ago"
+    if diff < 86400:
+        return f"{diff // 3600}h ago"
+    return f"{diff // 86400}d ago"
+
+
+def parse_rss_feed(url: str, default_source: str, limit: int = 15) -> list[dict]:
     items = []
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=8) as resp:
             root = ET.fromstring(resp.read())
-        for item in root.findall(".//item")[:max_items]:
+        for item in root.findall(".//item")[:limit]:
             title = (item.findtext("title") or "").strip()
+            link = (item.findtext("link") or "").strip()
+            pub_raw = (item.findtext("pubDate") or "").strip()
+            source = (item.findtext("source") or default_source).strip()
+            try:
+                dt = parsedate_to_datetime(pub_raw)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=datetime.timezone.utc)
+                else:
+                    dt = dt.astimezone(datetime.timezone.utc)
+            except Exception:
+                dt = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=7)
             if title:
                 items.append({
                     "tag": tag_headline(title),
                     "title": title,
-                    "source": (item.findtext("source") or "News").strip(),
-                    "time": (item.findtext("pubDate") or "")[:22],
-                    "url": (item.findtext("link") or "").strip(),
+                    "source": source,
+                    "dt": dt,
+                    "time": format_age(dt),
+                    "url": link,
                 })
     except Exception:
         pass
     return items
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=120, show_spinner=False)
+def fetch_breaking_macro_news(max_items: int = 10) -> list[dict]:
+    """Merge breaking 12h Google News (tariffs, Fed, tech/Nasdaq) + CNBC Markets, sorted newest-first."""
+    g_query = "(Trump OR tariff OR Nasdaq OR \"S&P 500\" OR \"Treasury yield\" OR Fed OR Nvidia OR semiconductors) (plunge OR drop OR surge OR rally OR selloff OR stocks OR market) when:12h"
+    g_url = f"https://news.google.com/rss/search?q={urllib.parse.quote(g_query)}&hl=en-US&gl=US&ceid=US:en"
+    cnbc_url = "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=15839069"
+
+    combined = parse_rss_feed(g_url, "Google News", limit=18) + parse_rss_feed(cnbc_url, "CNBC", limit=12)
+
+    # Deduplicate by normalized title and sort strictly newest-first
+    seen, unique = set(), []
+    for it in sorted(combined, key=lambda x: x["dt"], reverse=True):
+        key = it["title"].lower()[:55]
+        if key not in seen:
+            seen.add(key)
+            unique.append(it)
+    return unique[:max_items]
+
+
+@st.cache_data(ttl=120, show_spinner=False)
 def fetch_ticker_news(ticker: str, max_items: int = 6) -> list[dict]:
+    """Combine yfinance ticker news + 24h Google News for the ticker, sorted newest-first."""
     items = []
     try:
         for n in (yf.Ticker(ticker).news or [])[:max_items]:
             c = n.get("content", n) if isinstance(n, dict) else {}
             title = (c.get("title") or "").strip()
             url = (c.get("canonicalUrl") or {}).get("url") or (c.get("clickThroughUrl") or {}).get("url") or c.get("link") or ""
+            pub_raw = str(c.get("pubDate") or "")
+            try:
+                dt = datetime.datetime.fromisoformat(pub_raw.replace("Z", "+00:00"))
+            except Exception:
+                dt = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=2)
             if title:
                 items.append({
                     "tag": tag_headline(title),
                     "title": title,
                     "source": (c.get("provider") or {}).get("displayName") or c.get("publisher") or "Yahoo Finance",
-                    "time": str(c.get("pubDate") or "")[:16].replace("T", " "),
+                    "dt": dt,
+                    "time": format_age(dt),
                     "url": url,
                 })
     except Exception:
         pass
-    return items
+
+    g_url = f"https://news.google.com/rss/search?q={urllib.parse.quote(f'{ticker} stock when:1d')}&hl=en-US&gl=US&ceid=US:en"
+    items += parse_rss_feed(g_url, "Google News", limit=6)
+
+    seen, unique = set(), []
+    for it in sorted(items, key=lambda x: x["dt"], reverse=True):
+        key = it["title"].lower()[:55]
+        if key not in seen:
+            seen.add(key)
+            unique.append(it)
+    return unique[:max_items]
 
 
 def render_news_list(items: list[dict], empty_msg: str = "No recent headlines found."):
@@ -893,7 +951,7 @@ def render_news_list(items: list[dict], empty_msg: str = "No recent headlines fo
         link_md = f"[{it['title']}]({it['url']})" if it["url"] else it["title"]
         st.markdown(
             f"**{it['tag']}** — {link_md}  \n"
-            f"<span class='small-muted'>{it['source']} • {it['time']}</span>",
+            f"<span class='small-muted'>{it['source']} • <b>{it['time']}</b></span>",
             unsafe_allow_html=True,
         )
 
@@ -975,7 +1033,7 @@ def reset_and_refresh_live():
     fetch_live_intraday_tape.clear()
     fetch_live_market_data.clear()
     scan_watchlist.clear()
-    fetch_google_rss.clear()
+    fetch_breaking_macro_news.clear()
     fetch_ticker_news.clear()
     for k in SIM_KEYS:
         if k in st.session_state:
@@ -1192,10 +1250,10 @@ with tab_news:
     n_macro, n_movers, n_tick, n_cal = st.tabs(["🏛️ Macro", "⚡ Unusual Movers", "🎯 Ticker", "📅 Earnings Radar"])
 
     with n_macro:
-        render_news_list(
-            fetch_google_rss("(Treasury yield OR Federal Reserve OR VIX OR Nasdaq OR S&P 500) stock market when:2d", max_items=6),
-            "Could not load macro headlines right now.",
-        )
+    render_news_list(
+        fetch_breaking_macro_news(max_items=10),
+        "Could not load breaking macro headlines right now.",
+    )
 
     with n_movers:
         if not wl_df.empty and "Ext. Reading" in wl_df.columns:
